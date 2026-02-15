@@ -119,6 +119,11 @@ void sensorTask(void * pvParameters) {
 // In Signal K server: add connection -> "Signal K (Delta) over UDP" on this port
 #define SIGNALK_UDP_PORT_DEFAULT 10110
 uint16_t signalkUdpPort = SIGNALK_UDP_PORT_DEFAULT;
+
+// mDNS hostname (configurable via web UI, stored in NVS)
+#define MDNS_DEFAULT "s3imu"
+char mdnsName[32] = MDNS_DEFAULT;
+
 Preferences prefs;
 
 // Send Signal K delta JSON via UDP broadcast
@@ -220,7 +225,10 @@ void setup() {
   // Load saved settings from NVS
   prefs.begin("config", false);
   signalkUdpPort = prefs.getUShort("skport", SIGNALK_UDP_PORT_DEFAULT);
+  String storedName = prefs.getString("mdns", MDNS_DEFAULT);
+  storedName.toCharArray(mdnsName, sizeof(mdnsName));
   Serial.printf("Signal K UDP port: %d\n", signalkUdpPort);
+  Serial.printf("mDNS hostname: %s.local\n", mdnsName);
 
   // Initialize I2C with Custom Pins
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -244,8 +252,8 @@ void setup() {
   if (wifiManager.autoConnect("S3_IMU_GATEWAY")) {
     Serial.print("WiFi connected! IP: ");
     Serial.println(WiFi.localIP());
-    if (MDNS.begin("s3imu")) {
-      Serial.println("mDNS: http://s3imu.local");
+    if (MDNS.begin(mdnsName)) {
+      Serial.printf("mDNS: http://%s.local\n", mdnsName);
       MDNS.addService("http", "tcp", 80);
     }
     flashLED(0, RGB_BRIGHTNESS, 0, 3, 150); // Green flash = connected
@@ -299,6 +307,12 @@ void setup() {
     html += "<p>Pitch: <span id='p'>--</span>&deg; &nbsp; Roll: <span id='r'>--</span>&deg;</p>";
     html += "<p>ROT: <span id='rot'>--</span>&deg;/s</p>";
     html += "<p>Quat Accuracy: <span id='qa'>0</span>/3 &nbsp; Mag Accuracy: <span id='ma'>0</span>/3</p>";
+    html += "<div class='section'><b>Device Name (mDNS)</b><br>";
+    html += "<input id='name' type='text' style='width:140px' maxlength='24' value='" + String(mdnsName) + "'>";
+    html += "<span class='info'>.local</span> ";
+    html += "<button onclick=\"fetch('/setname?name='+document.getElementById('name').value)";
+    html += ".then(r=>r.text()).then(t=>{document.getElementById('ns').innerHTML=t})\">SET</button>";
+    html += "<p id='ns' class='info'></p></div>";
     html += "<div class='section'><b>Signal K UDP Port</b><br>";
     html += "<input id='port' type='number' min='1024' max='65535' value='" + String(signalkUdpPort) + "'>";
     html += "<button onclick=\"fetch('/setport?port='+document.getElementById('port').value)";
@@ -319,6 +333,31 @@ void setup() {
     html += "document.getElementById('ma').innerHTML=d.macc;";
     html += "};</script></body></html>";
     request->send(200, "text/html", html);
+  });
+
+  server.on("/setname", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("name")) {
+      String newName = request->getParam("name")->value();
+      newName.trim();
+      newName.toLowerCase();
+      // Validate: 1-24 chars, alphanumeric + hyphens only
+      bool valid = newName.length() >= 1 && newName.length() <= 24;
+      for (unsigned int i = 0; valid && i < newName.length(); i++) {
+        char c = newName.charAt(i);
+        if (!isalnum(c) && c != '-') valid = false;
+      }
+      if (valid) {
+        prefs.putString("mdns", newName);
+        Serial.printf("mDNS name changed to %s.local (rebooting)\n", newName.c_str());
+        request->send(200, "text/plain", "Name set to " + newName + ".local — rebooting...");
+        delay(1000);
+        ESP.restart();
+      } else {
+        request->send(400, "text/plain", "Invalid name (a-z, 0-9, hyphens, 1-24 chars)");
+      }
+    } else {
+      request->send(400, "text/plain", "Missing ?name= parameter");
+    }
   });
 
   server.on("/setport", HTTP_GET, [](AsyncWebServerRequest *request){

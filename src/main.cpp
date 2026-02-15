@@ -18,10 +18,12 @@
 #include <DNSServer.h>
 #include <ESPAsyncWiFiManager.h>
 #include <WiFiUdp.h>
+#include <ESPmDNS.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
 #include <SparkFun_BNO080_Arduino_Library.h>
+#include <Preferences.h>
 
 // I2C Pin Mapping for "Sandwich" Solder
 #define SDA_PIN 8
@@ -50,6 +52,7 @@ void flashLED(uint8_t r, uint8_t g, uint8_t b, int times, int ms) {
 BNO080 myIMU;
 WiFiUDP udp;
 AsyncWebServer server(80);
+DNSServer dns;
 AsyncEventSource events("/events");
 SemaphoreHandle_t radioMutex;
 
@@ -112,6 +115,43 @@ void sensorTask(void * pvParameters) {
   }
 }
 
+// Signal K delta JSON UDP port (configurable via web UI, stored in NVS)
+// In Signal K server: add connection -> "Signal K (Delta) over UDP" on this port
+#define SIGNALK_UDP_PORT_DEFAULT 10110
+uint16_t signalkUdpPort = SIGNALK_UDP_PORT_DEFAULT;
+Preferences prefs;
+
+// Send Signal K delta JSON via UDP broadcast
+// SK natively parses this format — no NMEA sentence limitations
+void sendSignalKDelta() {
+  float headRad  = currentData.h   * DEG_TO_RAD;
+  float pitchRad = currentData.p   * DEG_TO_RAD;
+  float rollRad  = currentData.r   * DEG_TO_RAD;
+  float yawRad   = headRad;  // yaw = heading for marine convention
+  float rotRad   = currentData.rot * DEG_TO_RAD; // deg/s -> rad/s
+
+  // Accuracy: 0=unreliable, 1=low, 2=medium, 3=high
+  // Normalize to 0.0-1.0 ratio for Signal K convention
+  float magAccNorm  = currentData.magAcc  / 3.0f;
+  float quatAccNorm = currentData.quatAcc / 3.0f;
+
+  char delta[600];
+  snprintf(delta, sizeof(delta),
+    "{\"updates\":[{\"source\":{\"label\":\"BNO085\",\"type\":\"IMU\"},"
+    "\"values\":["
+    "{\"path\":\"navigation.headingMagnetic\",\"value\":%.6f},"
+    "{\"path\":\"navigation.rateOfTurn\",\"value\":%.6f},"
+    "{\"path\":\"navigation.attitude\",\"value\":{\"roll\":%.6f,\"pitch\":%.6f,\"yaw\":%.6f}},"
+    "{\"path\":\"sensors.imu.compassCalibration\",\"value\":%.2f},"
+    "{\"path\":\"sensors.imu.fusionCalibration\",\"value\":%.2f}"
+    "]}]}",
+    headRad, rotRad, rollRad, pitchRad, yawRad, magAccNorm, quatAccNorm);
+
+  udp.beginPacket("255.255.255.255", signalkUdpPort);
+  udp.print(delta);
+  udp.endPacket();
+}
+
 // --- CORE 0: COMMS TASK (WiFi/BLE) ---
 void commsTask(void * pvParameters) {
   for(;;) {
@@ -132,11 +172,14 @@ void commsTask(void * pvParameters) {
                        ",\"macc\":" + String(currentData.magAcc) + "}";
 
       if (wifiActive) {
-        // WiFi UDP Broadcast
+        // JSON UDP Broadcast (port 4210)
         udp.beginPacket("255.255.255.255", 4210);
         udp.print(payload);
         udp.endPacket();
         events.send(payload.c_str(), "message", millis());
+
+        // Signal K delta JSON broadcast (all data in SI units)
+        sendSignalKDelta();
       }
 
       // BLE Always Broadcasts (Failover)
@@ -166,31 +209,48 @@ void ledTask(void * pvParameters) {
 
 void setup() {
   Serial.begin(115200);
+  delay(2000); // Allow USB-Serial/JTAG to enumerate
+  Serial.println("\n=== S3_IMU_GATEWAY Boot ===");
   
   // Boot indicator - brief white flash
   setLED(RGB_BRIGHTNESS, RGB_BRIGHTNESS, RGB_BRIGHTNESS);
   delay(300);
   setLED(0, 0, 0);
 
+  // Load saved settings from NVS
+  prefs.begin("config", false);
+  signalkUdpPort = prefs.getUShort("skport", SIGNALK_UDP_PORT_DEFAULT);
+  Serial.printf("Signal K UDP port: %d\n", signalkUdpPort);
+
   // Initialize I2C with Custom Pins
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
 
-  // --- WiFi: Optional, non-blocking ---
-  Serial.println("Trying WiFi (5s timeout)...");
-  setLED(0, 0, RGB_BRIGHTNESS); // Blue while trying
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(); // Use saved credentials
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 5000) {
-    flashLED(0, 0, RGB_BRIGHTNESS, 1, 250);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
+  // --- WiFi: Captive Portal via ESPAsyncWiFiManager ---
+  Serial.println("Starting WiFiManager...");
+  setLED(0, 0, RGB_BRIGHTNESS); // Blue while configuring
+
+  AsyncWiFiManager wifiManager(&server, &dns);
+  wifiManager.setAPCallback([](AsyncWiFiManager *mgr) {
+    Serial.println("WiFi captive portal active!");
+    Serial.print("Connect to AP: ");
+    Serial.println(mgr->getConfigPortalSSID());
+    Serial.println("Then open http://192.168.4.1");
+  });
+  // Portal stays open for 3 minutes, then continues with BLE-only
+  wifiManager.setConfigPortalTimeout(180);
+
+  // autoConnect: tries saved creds first, if fail -> opens AP "S3_IMU_GATEWAY"
+  if (wifiManager.autoConnect("S3_IMU_GATEWAY")) {
     Serial.print("WiFi connected! IP: ");
     Serial.println(WiFi.localIP());
-    flashLED(0, RGB_BRIGHTNESS, 0, 3, 150);
+    if (MDNS.begin("s3imu")) {
+      Serial.println("mDNS: http://s3imu.local");
+      MDNS.addService("http", "tcp", 80);
+    }
+    flashLED(0, RGB_BRIGHTNESS, 0, 3, 150); // Green flash = connected
   } else {
-    Serial.println("WiFi not available - continuing with BLE only");
+    Serial.println("WiFi portal timed out - continuing with BLE only");
     flashLED(RGB_BRIGHTNESS, RGB_BRIGHTNESS/2, 0, 2, 200); // Yellow = no WiFi
   }
 
@@ -223,20 +283,70 @@ void setup() {
   Serial.println("BLE advertising as S3_IMU_GATEWAY");
   flashLED(0, RGB_BRIGHTNESS, RGB_BRIGHTNESS, 3, 150); // Cyan confirm
 
-  // Web Dashboard
+  // Web Dashboard (set up after WiFiManager releases the server)
+  server.reset(); // Clear WiFiManager routes
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    String html = "<html><body style='background:#222; color:#0f0; text-align:center;'>";
-    html += "<h1>BNO085 S3 Gateway</h1><h2 id='h'>0.0</h2>";
-    html += "<p>Accuracy: <span id='a'>0</span>/3</p><button onclick=\"fetch('/save')\">SAVE CALIBRATION</button>";
+    String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<style>body{background:#222;color:#0f0;text-align:center;font-family:monospace;margin:20px}";
+    html += "h1{font-size:1.4em}h2{font-size:3em;margin:10px}";
+    html += "input,button{font-size:1em;padding:8px 16px;margin:4px;border-radius:6px;border:1px solid #0f0}";
+    html += "input{background:#333;color:#0f0;width:80px;text-align:center}";
+    html += "button{background:#0f0;color:#222;cursor:pointer}button:hover{background:#0a0}";
+    html += ".info{color:#888;font-size:0.85em}.section{margin:20px auto;padding:10px;border:1px solid #333;border-radius:8px;max-width:400px}";
+    html += "</style></head><body>";
+    html += "<h1>BNO085 S3 Gateway</h1>";
+    html += "<h2 id='h'>---</h2>";
+    html += "<p>Pitch: <span id='p'>--</span>&deg; &nbsp; Roll: <span id='r'>--</span>&deg;</p>";
+    html += "<p>ROT: <span id='rot'>--</span>&deg;/s</p>";
+    html += "<p>Quat Accuracy: <span id='qa'>0</span>/3 &nbsp; Mag Accuracy: <span id='ma'>0</span>/3</p>";
+    html += "<div class='section'><b>Signal K UDP Port</b><br>";
+    html += "<input id='port' type='number' min='1024' max='65535' value='" + String(signalkUdpPort) + "'>";
+    html += "<button onclick=\"fetch('/setport?port='+document.getElementById('port').value)";
+    html += ".then(r=>r.text()).then(t=>{document.getElementById('ps').innerHTML=t;setTimeout(()=>document.getElementById('ps').innerHTML='',3000)})\">SET</button>";
+    html += "<p id='ps' class='info'></p>";
+    html += "<p class='info'>Current: port <span id='cp'>" + String(signalkUdpPort) + "</span> (UDP broadcast)</p></div>";
+    html += "<div class='section'>";
+    html += "<button onclick=\"fetch('/save').then(r=>r.text()).then(t=>alert(t))\">SAVE CALIBRATION</button> ";
+    html += "<button onclick=\"if(confirm('Clear WiFi credentials and reboot?'))fetch('/resetwifi')\">RESET WIFI</button>";
+    html += "</div>";
     html += "<script>var s=new EventSource('/events');s.onmessage=function(e){";
-    html += "var d=JSON.parse(e.data);document.getElementById('h').innerHTML=d.h+'&deg;';";
-    html += "document.getElementById('a').innerHTML=d.acc;};</script></body></html>";
+    html += "var d=JSON.parse(e.data);";
+    html += "document.getElementById('h').innerHTML=d.h.toFixed(1)+'&deg;';";
+    html += "document.getElementById('p').innerHTML=d.p.toFixed(1);";
+    html += "document.getElementById('r').innerHTML=d.r.toFixed(1);";
+    html += "document.getElementById('rot').innerHTML=d.rot.toFixed(2);";
+    html += "document.getElementById('qa').innerHTML=d.qacc;";
+    html += "document.getElementById('ma').innerHTML=d.macc;";
+    html += "};</script></body></html>";
     request->send(200, "text/html", html);
+  });
+
+  server.on("/setport", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("port")) {
+      uint16_t newPort = request->getParam("port")->value().toInt();
+      if (newPort >= 1024 && newPort <= 65535) {
+        signalkUdpPort = newPort;
+        prefs.putUShort("skport", signalkUdpPort);
+        Serial.printf("Signal K UDP port changed to %d\n", signalkUdpPort);
+        request->send(200, "text/plain", "Port set to " + String(signalkUdpPort) + " (saved)");
+      } else {
+        request->send(400, "text/plain", "Invalid port (1024-65535)");
+      }
+    } else {
+      request->send(400, "text/plain", "Missing ?port= parameter");
+    }
   });
 
   server.on("/save", HTTP_GET, [](AsyncWebServerRequest *request){
     myIMU.saveCalibration();
     request->send(200, "text/plain", "Flash Updated");
+  });
+
+  server.on("/resetwifi", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", "WiFi credentials cleared. Rebooting...");
+    delay(1000);
+    WiFi.disconnect(true, true); // Erase saved credentials
+    ESP.restart();
   });
 
   server.addHandler(&events);

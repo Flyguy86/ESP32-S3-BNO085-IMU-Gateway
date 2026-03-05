@@ -1,0 +1,18 @@
+[Unit]
+Description=PyPilot TCP Serial Bridge (socat → ESP32 WiFi bridge)
+Documentation=https://github.com/pypilot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat \
+    pty,link=/dev/pypilot-servo,raw,echo=0,waitslave,unlink-close=0 \
+    tcp:pypilot-bridge.local:20220,retry=forever,interval=5,keepalive,keepidle=10,keepintvl=5,keepcnt=3
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 20); do [ -e /dev/pypilot-servo ] && chmod 666 /dev/pypilot-servo && break; sleep 0.5; done'
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

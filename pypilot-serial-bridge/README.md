@@ -399,7 +399,7 @@ The systemd service runs:
 
 ```
 socat pty,link=/dev/pypilot-servo,raw,echo=0,waitslave,unlink-close=0 \
-      tcp:pypilot-bridge.local:20220,retry=forever,interval=5,keepalive,...
+      tcp:pypilot-bridge.local:20220,retry=2147483647,interval=5,keepalive,...
 ```
 
 After `socat` creates the PTY, an `ExecStartPost` step waits for `/dev/pypilot-servo` to appear and runs `chmod 666` on it so that non-root users (e.g., the `pypilot` or `pi` user) can read/write the virtual serial port. Without this, `pypilot_servo` will repeatedly probe the port but fail to open it due to insufficient permissions.

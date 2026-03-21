@@ -48,7 +48,7 @@ Do **not** add delays, extra processing, or polling loops that increase time-to-
 ### 2. Maximise Stability
 The system must keep running at sea with no manual intervention. Stability means:
 - **Services never give up** — all systemd units must use `Restart=always` + `StartLimitIntervalSec=0`
-- **socat never stops retrying** — `retry=forever` is mandatory in `pypilot-bridge.service`
+- **socat never stops retrying** — `retry=2147483647` is mandatory in `pypilot-bridge.service` (`retry=forever` is NOT supported on socat 1.8.x — it requires a numeric value)
 - **WiFi loss is tolerated** — firmware must reconnect automatically without needing a reset
 - **No silent failures** — if a layer stops, `pypilot-status.service` must detect and display it
 - **No single point of failure in software** — a crashed service restarts in ≤5 s
@@ -137,13 +137,13 @@ The README header must include a version tag. **Increment the version with every
 ```
 ESP32-S3 BNO085
   └─ commsTask 40 Hz (25 ms)
-  └─► Signal K delta UDP → 255.255.255.255:101022  [40 Hz, ~1–5 ms WiFi hop]
+  └─► Signal K delta UDP → 255.255.255.255:10123  [40 Hz, ~1–5 ms WiFi hop]
         └─► Signal K Server (signalk.service) :3000
               └─► WebSocket push to PyPilot  [25 ms — signalk.period=0.025]
                     └─► PyPilot PID loop 40 Hz  [25 ms — imu.rate=40]
                           │  servo.period=0.1 (motor stiction window, NOT PID rate)
                           └─► writes to /dev/pypilot-servo (PTY, <1 ms)
-                                └─► socat (pypilot-bridge.service, retry=forever)
+                                └─► socat (pypilot-bridge.service, retry=2147483647)
                                       └─► TCP to pypilot-bridge.local:20220  [~2–5 ms]
                                             └─► ESP32-C3 TCP→UART bridge
                                                   └─► UART 38400 baud → Motor controller
@@ -162,7 +162,7 @@ ESP32-S3 BNO085
 | `src/main.cpp` | ESP32-S3 firmware: sensor + WiFi + BLE + Signal K |
 | `pypilot-serial-bridge/src/main.cpp` | ESP32-C3 firmware: WiFi TCP bridge |
 | `pypilot-serial-bridge/src/web_console.cpp` | ESP32-C3 motor diagnostics web UI |
-| `pypilot-serial-bridge/pi-setup/pypilot-bridge.service` | socat PTY service (retry=forever) |
+| `pypilot-serial-bridge/pi-setup/pypilot-bridge.service` | socat PTY service (retry=2147483647) |
 | `pypilot-serial-bridge/pi-setup/pypilot-status.py` | Status web server (pypilotstatus.local) |
 | `pypilot-serial-bridge/pi-setup/pypilot-status.service` | Systemd unit for status server |
 | `pypilot-serial-bridge/pi-setup/check-pypilot.sh` | CLI diagnostic script (legacy) |
@@ -173,18 +173,20 @@ ESP32-S3 BNO085
 
 ## Critical Constraints
 
-### socat service MUST use retry=forever
-The `pypilot-bridge.service` socat command MUST include `retry=forever` and the unit MUST have `StartLimitIntervalSec=0`. Without these, the service gives up when the ESP32-C3 reboots and `/dev/pypilot-servo` disappears permanently.
+### socat service MUST use retry=2147483647
+The `pypilot-bridge.service` socat command MUST include `retry=2147483647` and the unit MUST have `StartLimitIntervalSec=0`. Without these, the service gives up when the ESP32-C3 reboots and `/dev/pypilot-servo` disappears permanently.
+
+**IMPORTANT:** `retry=forever` is NOT supported on socat 1.8.x (Ubuntu 24.04) — socat requires a numeric value and will exit immediately with a parse error if `forever` is used. Use `retry=2147483647` (MAX_INT — ~340 years at 5 s intervals).
 
 **Correct:**
 ```
-tcp:pypilot-bridge.local:20220,retry=forever,interval=5,keepalive,...
+tcp:pypilot-bridge.local:20220,retry=2147483647,interval=5,keepalive,...
 ```
 
 ### Signal K UDP port for compass
-The ESP32-S3 broadcasts Signal K delta UDP to a configurable port. Signal K has a `SingalK_UDP_101022` provider enabled on port **101022**. Port 10110 is already used by NMEA GPS — do NOT use it for Signal K delta.
+The ESP32-S3 broadcasts Signal K delta UDP to a configurable port. Signal K has a `SignalK_UDP_10123` provider enabled on port **10123**. Port 10110 is already used by NMEA GPS — do NOT use it for Signal K delta. Port 10122 is used by another system — do NOT use it.
 
-To change the compass's target port: `http://compass.local/setport?port=101022`
+To change the compass's target port: `http://compass.local/setport?port=10123`
 
 ### PyPilot IMU source
 PyPilot must use `imu.source = "signalk"` to receive heading from the BNO085 via Signal K. If it's `"local"`, it uses non-existent local hardware and autopilot gets no heading.
@@ -198,7 +200,7 @@ The ESP32-C3 firmware uses `min_spiffs.csv` partition scheme (1.875 MB app slots
 
 | File | Critical setting |
 |------|-----------------|
-| `~/.signalk/settings.json` | `SingalK_UDP_101022` provider enabled on port 101022 |
+| `~/.signalk/settings.json` | `SignalK_UDP_10123` provider enabled on port 10123 |
 | `~/.pypilot/pypilot.conf` | `imu.source="signalk"`, `signalk.host="localhost"`, `signalk.period=0.025`, `imu.rate=40`, `servo.period=0.1` |
 | `~/.pypilot/serial_ports` | `/dev/pypilot-servo` |
 | `~/.pypilot/servodevice` | `["/dev/pypilot-servo", 38400]` |
@@ -223,7 +225,7 @@ pio run -e esp32c3
 
 # Status web server (systemd)
 systemctl status pypilot-status.service
-# Browse: http://pypilotstatus.local
+# Browse: http://pypilotstatus.local:8083
 ```
 
 ---
@@ -232,8 +234,8 @@ systemctl status pypilot-status.service
 
 - [ ] Architecture diagram in README still accurate?
 - [ ] Version number incremented in README header?
-- [ ] `socat retry=forever` still present in pypilot-bridge.service?
-- [ ] Signal K UDP port still 101022?
+- [ ] `socat retry=2147483647` still present in pypilot-bridge.service? (NOT `retry=forever` — unsupported on socat 1.8.x)
+- [ ] Signal K UDP port still 10123?
 - [ ] `imu.source = "signalk"` still in pypilot.conf?
 - [ ] Both firmwares build without errors? (`pio run`)
 - [ ] ESP32-C3 flash < 95%? (`pio run -e esp32c3 --target size`)

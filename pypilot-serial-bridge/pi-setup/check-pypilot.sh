@@ -240,7 +240,7 @@ else
     if grep -q "retry=10" /etc/systemd/system/pypilot-bridge.service 2>/dev/null; then
         warn "KNOWN BUG in installed service: uses retry=10 (socat quits after 10 failed attempts)"
         info "This is why it keeps dying whenever the ESP32-C3 reboots."
-        fix "sed -i 's/retry=10/retry=forever/' /etc/systemd/system/pypilot-bridge.service && systemctl daemon-reload"
+        fix "sed -i 's/retry=forever/retry=2147483647/' /etc/systemd/system/pypilot-bridge.service && sed -i 's/retry=10/retry=2147483647/' /etc/systemd/system/pypilot-bridge.service && systemctl daemon-reload"
     fi
 
     if ! grep -q "StartLimitIntervalSec=0" /etc/systemd/system/pypilot-bridge.service 2>/dev/null; then

@@ -51,6 +51,7 @@ DNSServer dnsServer;
 AsyncEventSource events("/events");
 SemaphoreHandle_t radioMutex;
 Preferences prefs;
+static bool g_mdnsRegistered = false;  // set when mDNS is up; cleared on WiFi drop so it re-registers on reconnect
 
 // BLE
 BLECharacteristic *pCharacteristic;
@@ -464,11 +465,13 @@ static void updateDriftTracking(float heading) {
   }
 }
 
-// Compute yaw from quaternion components (returns degrees)
+// Compute yaw from quaternion components (returns degrees, clockwise = increasing).
+// BNO085 uses right-hand convention (CCW = positive yaw), but compass convention is
+// clockwise = increasing, so negate the atan2 result.
 static float quatToYaw(float qi, float qj, float qk, float qr) {
   float siny_cosp = 2.0f * (qr * qk + qi * qj);
   float cosy_cosp = 1.0f - 2.0f * (qj * qj + qk * qk);
-  return atan2(siny_cosp, cosy_cosp) * 180.0f / PI;
+  return -atan2(siny_cosp, cosy_cosp) * 180.0f / PI;
 }
 
 // =====================================================================
@@ -657,8 +660,35 @@ void sendSignalKDelta() {
 }
 
 void commsTask(void * pvParameters) {
+  static uint32_t wifiDownMs = 0;
+  static uint32_t lastSseMs  = 0;   // SSE web push throttle — 4 Hz max (humans can't read 40 Hz)
   for (;;) {
     bool wifiOk = (WiFi.status() == WL_CONNECTED);
+
+    // (Re-)register mDNS each time WiFi (re)connects.
+    // Handles: normal boot, boot-before-AP-is-up, and runtime disconnects.
+    if (wifiOk && !g_mdnsRegistered) {
+      if (MDNS.begin(cfg.mdnsName)) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addServiceTxt("http", "tcp", "swname", "compass-gateway");
+        MDNS.addServiceTxt("http", "tcp", "txtvers", "1");
+        MDNS.addServiceTxt("http", "tcp", "path", "/");
+        Serial.printf("[WIFI] Connected — IP %s  http://%s.local\n",
+                      WiFi.localIP().toString().c_str(), cfg.mdnsName);
+      }
+      g_mdnsRegistered = true;
+    } else if (!wifiOk) {
+      if (g_mdnsRegistered) Serial.println("[WIFI] Disconnected — will reconnect");
+      g_mdnsRegistered = false;
+      // Belt-and-suspenders: if SDK auto-reconnect hasn't kicked in within 30 s, force it
+      if (!wifiDownMs) wifiDownMs = millis();
+      if (millis() - wifiDownMs > 30000) {
+        WiFi.reconnect();
+        wifiDownMs = millis();
+      }
+    } else {
+      wifiDownMs = 0;
+    }
 
     if (xSemaphoreTake(radioMutex, portMAX_DELAY)) {
       String payload = "{\"h\":" + String(currentData.h, 1) +
@@ -682,7 +712,12 @@ void commsTask(void * pvParameters) {
         udp.beginPacket("255.255.255.255", 4210);
         udp.print(payload);
         udp.endPacket();
-        events.send(payload.c_str(), "message", millis());
+        // SSE to web browsers — throttled to 4 Hz to prevent AsyncEventSource queue overflow
+        uint32_t now = millis();
+        if (now - lastSseMs >= 250) {
+          events.send(payload.c_str(), "message", now);
+          lastSseMs = now;
+        }
         sendSignalKDelta();
       }
 
@@ -833,6 +868,7 @@ void startBridgeMode() {
   Serial.printf("[WIFI] Connecting to '%s'...\n", cfg.wifiSSID.c_str());
   setLED(0, 0, RGB_BRIGHTNESS);  // Blue
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);   // reconnect automatically whenever the AP drops
   WiFi.begin(cfg.wifiSSID.c_str(), cfg.wifiPass.c_str());
 
   int retries = 0;
@@ -851,9 +887,10 @@ void startBridgeMode() {
       MDNS.addServiceTxt("http", "tcp", "path", "/");
       Serial.printf("[mDNS] http://%s.local\n", cfg.mdnsName);
     }
+    g_mdnsRegistered = true;
     flashLED(0, RGB_BRIGHTNESS, 0, 3, 150);
   } else {
-    Serial.println("\n[WIFI] Connection failed — continuing with BLE only");
+    Serial.println("\n[WIFI] Connection failed — retrying in background (BLE still active)");
     flashLED(RGB_BRIGHTNESS, RGB_BRIGHTNESS/2, 0, 2, 200);
   }
 

@@ -100,6 +100,39 @@ else
     echo "  ⚠ pypilot-status.py not found in ${SCRIPT_DIR} — skipping"
 fi
 
+# Install avahi service file (DNS-SD/Bonjour discovery) and avahi hosts entry (A record)
+# The .service file allows DNS-SD browsers to discover the dashboard.
+# The hosts entry makes pypilotstatus.local resolve on the network via mDNS.
+echo "  Installing avahi config for pypilotstatus.local:8083..."
+sudo tee /etc/avahi/services/pypilot-status.service > /dev/null <<'EOF'
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">pypilot Status Monitor</name>
+  <service>
+    <type>_http._tcp</type>
+    <port>8083</port>
+    <txt-record>path=/</txt-record>
+  </service>
+</service-group>
+EOF
+# Add pypilotstatus.local -> local IP in /etc/avahi/hosts (avahi-daemon advertises this as an A record)
+HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/{print $7}' | head -1)
+if [ -n "${HOST_IP}" ]; then
+    # Remove any old entry then add fresh one
+    sudo sed -i '/pypilotstatus\.local/d' /etc/avahi/hosts
+    echo "${HOST_IP}  pypilotstatus.local" | sudo tee -a /etc/avahi/hosts > /dev/null
+    echo "  ✓ /etc/avahi/hosts: pypilotstatus.local → ${HOST_IP}"
+    # Also add to /etc/hosts for reliable local resolution (bypasses mDNS conflicts)
+    sudo sed -i '/pypilotstatus\.local/d' /etc/hosts
+    echo "${HOST_IP}  pypilotstatus.local" | sudo tee -a /etc/hosts > /dev/null
+    echo "  ✓ /etc/hosts: pypilotstatus.local → ${HOST_IP}"
+else
+    echo "  ⚠ Could not determine local IP — add manually: echo '192.168.x.x  pypilotstatus.local' | sudo tee -a /etc/avahi/hosts"
+fi
+sudo systemctl reload-or-restart avahi-daemon 2>/dev/null || true
+echo "  ✓ pypilotstatus.local registered (port 8083)"
+
 if [ -f "${STATUS_SERVICE}" ]; then
     # Patch the User= field to match the current user
     sed "s|^User=.*|User=${USER}|; s|^Environment=HOME=.*|Environment=HOME=${HOME}|" \
@@ -109,7 +142,7 @@ if [ -f "${STATUS_SERVICE}" ]; then
     sudo systemctl restart pypilot-status.service
     sleep 2
     if systemctl is-active --quiet pypilot-status.service; then
-        echo "  ✓ pypilot-status.service running → http://pypilotstatus.local"
+        echo "  ✓ pypilot-status.service running → http://pypilotstatus.local:8083"
     else
         echo "  ⚠ pypilot-status.service failed to start (check: journalctl -u pypilot-status.service)"
     fi

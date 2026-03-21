@@ -1,6 +1,6 @@
 # 🧭 ESP32-S3 BNO085 Marine IMU Gateway
 
-> **Version:** v1.3.0 — 2026-03-21
+> **Version:** v1.4.1 — 2026-03-21
 
 A high-stability 9-DOF orientation system designed for **marine autopilot** compass heading. Bridges high-fidelity BNO085 sensor fusion data over **BLE**, **WiFi** (UDP + Web Dashboard), and **Signal K** (delta JSON). Built for the ESP32-S3-N16R8 with a dual-core architecture that separates critical sensor sampling from wireless communication.
 
@@ -343,7 +343,7 @@ This device is one component in a four-layer autopilot chain. This section cover
 │  ESP32-S3 BNO085 (this device)                                  │
 │  compass.local  •  40 Hz (25 ms commsTask cycle)                │
 │  sensorTask 40 Hz Core 1 → commsTask 40 Hz Core 0              │
-│  Signal K delta UDP broadcast → 255.255.255.255:101022  [40 Hz] │
+│  Signal K delta UDP broadcast → 255.255.255.255:10123  [40 Hz]  │
 └───────────────────────┬─────────────────────────────────────────┘
                         │ UDP broadcast  [~1–5 ms WiFi hop]
                         ▼
@@ -357,7 +357,7 @@ This device is one component in a four-layer autopilot chain. This section cover
                         ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  PyPilot Autopilot  (pypilot.service + pypilot-web.service)     │
-│  /home/brian/pypilot  •  TCP port 23322  •  Web UI port 8080   │
+│  /home/brian/pypilot  •  TCP port 20220  •  Web UI port 8080   │
 │  6-term PID (P I D DD PR FF)  •  imu.source = signalk          │
 │  PID loop 40 Hz  [25 ms — imu.rate=40]                         │
 │  servo.period=0.1 — motor stiction windup window               │
@@ -368,7 +368,7 @@ This device is one component in a four-layer autopilot chain. This section cover
 ┌─────────────────────────────────────────────────────────────────┐
 │  socat  (pypilot-bridge.service)                                │
 │  /dev/pypilot-servo  ←→  TCP → pypilot-bridge.local:20220      │
-│  retry=forever  •  keepalive 10/5/3  •  StartLimitIntervalSec=0│
+│  retry=2147483647  •  keepalive 10/5/3  •  StartLimitIntervalSec=0│
 └───────────────────────┬─────────────────────────────────────────┘
                         │ TCP WiFi  [~2–5 ms]
                         ▼
@@ -391,7 +391,7 @@ This device is one component in a four-layer autopilot chain. This section cover
   PID rate = 1/imu.rate = 1/40 = 25 ms. signalk.period = SK minPeriod = 25 ms.
 ```
 
-> **System Status Dashboard:** `http://pypilotstatus.local` — live health monitor
+> **System Status Dashboard:** `http://pypilotstatus.local:8083` — live health monitor
 > for all layers, served by `pypilot-status.service`
 
 ---
@@ -404,7 +404,7 @@ This device is one component in a four-layer autopilot chain. This section cover
 | `pypilot-bridge.service` | socat creates `/dev/pypilot-servo` PTY bridged over WiFi to ESP32-C3 | `/etc/systemd/system/pypilot-bridge.service` |
 | `pypilot.service` | Main autopilot process — PID, heading control, servo output | `/etc/systemd/system/pypilot.service` |
 | `pypilot-web.service` | Web UI for pypilot (port 8080) | `/etc/systemd/system/pypilot-web.service` |
-| `pypilot-status.service` | Status monitor web server — `http://pypilotstatus.local` (port 80) | `/etc/systemd/system/pypilot-status.service` |
+| `pypilot-status.service` | Status monitor web server — `http://pypilotstatus.local:8083` | `/etc/systemd/system/pypilot-status.service` |
 
 #### Useful service commands
 
@@ -505,10 +505,10 @@ sudo systemctl restart pypilot-bridge.service
 
 ### Status Web Monitor
 
-**`pypilot-status.service`** runs a persistent live dashboard at `http://pypilotstatus.local`
-(port 80). It checks all 6 layers every 10 seconds and shows per-layer status cards with
-timing notes and direct links. The mDNS hostname is registered via `avahi-publish-address`
-automatically on service start.
+**`pypilot-status.service`** runs a persistent live dashboard at `http://pypilotstatus.local:8083`
+(port 8083). It checks all 6 layers every 10 seconds and shows per-layer status cards with
+timing notes and direct links. The mDNS hostname `pypilotstatus.local` is registered via
+`/etc/avahi/hosts` and `/etc/avahi/services/pypilot-status.service` (created by `setup-bridge.sh`).
 
 ```bash
 # Check service status
@@ -521,7 +521,7 @@ journalctl -u pypilot-status.service -f
 systemctl restart pypilot-status.service
 ```
 
-JSON API for scripting: `http://pypilotstatus.local/api/status`
+JSON API for scripting: `http://pypilotstatus.local:8083/api/status`
 
 ### Diagnostic Script (CLI)
 
@@ -567,7 +567,7 @@ Example output when healthy:
 | Symptom | Root Cause | Fix |
 |---------|-----------|-----|
 | `/dev/pypilot-servo` missing | `pypilot-bridge.service` failed & hit systemd restart limit | `systemctl reset-failed pypilot-bridge.service && systemctl start pypilot-bridge.service` |
-| Service shows 1000+ restarts then stops | Old service had `retry=10` — socat quits after 10 failed TCP attempts | Reinstall service file from repo (now uses `retry=forever`) |
+| Service shows 1000+ restarts then stops | Old service had `retry=10` — socat quits after 10 failed TCP attempts | Reinstall service file from repo (now uses `retry=2147483647`) |
 | Heading stale in SignalK (>60s old) | ESP32-S3 lost WiFi or rebooted | Check `compass.local` reachable; check green LED pulse |
 | Heading missing from Signal K entirely | Port mismatch — compass broadcasts to port X, SK listens on port Y | Run `./check-pypilot.sh` — it detects and shows exact fix URL |
 | Heading missing from Signal K entirely | Port 10110 taken by NMEA GPS provider, SK can't parse Signal K JSON on same port | Add new SK delta UDP input on different port AND change compass: `http://compass.local/setport?port=NNNN` |
@@ -582,7 +582,7 @@ Example output when healthy:
 
 | URL | What it shows |
 |-----|--------------|
-| `http://pypilotstatus.local` | **Live system status dashboard** — all 6 layers, auto-refreshing |
+| `http://pypilotstatus.local:8083` | **Live system status dashboard** — all 6 layers, auto-refreshing |
 | `http://compass.local` | ESP32-S3 BNO085 live heading dashboard |
 | `http://pypilot-bridge.local` | ESP32-C3 motor controller diagnostics |
 | `http://localhost:3000/admin/#/databrowser` | Signal K live data browser |

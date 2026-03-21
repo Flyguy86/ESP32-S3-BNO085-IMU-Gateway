@@ -259,7 +259,7 @@ static String settingsProcessor(const String& var) {
     return String();
 }
 
-static void startStatusServer() {
+void startStatusServer() {
     statusServer.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
         req->send(200, "text/html", STATUS_HTML, templateProcessor);
     });
@@ -442,10 +442,9 @@ void setup() {
 
         // Still start WiFi + web server so settings page is accessible
         if (cfg.mode == BridgeMode::WIFI_TCP) {
+            // startStatusServer() is called inside bridgeWifiBegin() after WiFi connects
             xTaskCreate(bridgeWifiTask, "wifi_br", BRIDGE_TASK_STACK,
                         nullptr, BRIDGE_TASK_PRIO, nullptr);
-            delay(5000);
-            startStatusServer();
         }
     } else {
         // --- Normal bridge mode ---
@@ -454,12 +453,9 @@ void setup() {
 
         // Start wireless bridge (WiFi or BLE)
         if (cfg.mode == BridgeMode::WIFI_TCP) {
+            // startStatusServer() is called inside bridgeWifiBegin() after WiFi connects
             xTaskCreate(bridgeWifiTask, "wifi_br", BRIDGE_TASK_STACK,
                         nullptr, BRIDGE_TASK_PRIO, nullptr);
-            // Status web page (only in WiFi mode — we have a web server)
-            // Delay briefly so WiFi task can connect first
-            delay(5000);
-            startStatusServer();
         } else {
             xTaskCreate(bridgeBleTask, "ble_br", BRIDGE_TASK_STACK,
                         nullptr, BRIDGE_TASK_PRIO, nullptr);

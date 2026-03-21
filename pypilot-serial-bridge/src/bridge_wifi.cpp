@@ -12,6 +12,9 @@
 #include <WiFiClient.h>
 #include <ESPmDNS.h>
 
+// Forward declaration — defined in main.cpp
+extern void startStatusServer();
+
 static WiFiServer   tcpServer(DEFAULT_TCP_PORT);
 static WiFiClient   tcpClient;
 static bool         _clientConnected = false;
@@ -62,6 +65,7 @@ static bool connectWiFi() {
     Serial.printf("[WiFi] Connecting to '%s'%s ...\n", cfg.wifiSSID.c_str(),
                   cfg.wifiChannel ? (" ch" + String(cfg.wifiChannel)).c_str() : " (auto channel)");
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);   // reconnect automatically on AP drop
     if (cfg.wifiChannel > 0) {
         WiFi.begin(cfg.wifiSSID.c_str(), cfg.wifiPass.c_str(), cfg.wifiChannel);
     } else {
@@ -89,7 +93,9 @@ void bridgeWifiBegin() {
         ledStatusSet(LedState::ERROR);
         return;
     }
-
+    // Start HTTP status server NOW — WiFi is up (TCPIP task running) and
+    // tcpServer not yet started, so no competing lwIP calls (avoids IDF5 race).
+    startStatusServer();
     const auto& cfg = configManager.config();
     tcpServer = WiFiServer(cfg.tcpPort);
     tcpServer.begin();
@@ -130,8 +136,11 @@ void bridgeWifiLoop() {
         if (WiFi.status() != WL_CONNECTED && millis() - lastReconnect > 10000) {
             lastReconnect = millis();
             Serial.println("[WiFi] Lost connection — reconnecting...");
-            connectWiFi();
-            registerMDNS();
+            if (connectWiFi()) {
+                tcpServer.begin();        // restart TCP listener after WiFi reconnect
+                tcpServer.setNoDelay(true);
+                registerMDNS();
+            }
         }
         return;
     }

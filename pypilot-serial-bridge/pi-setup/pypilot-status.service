@@ -17,9 +17,5 @@ ExecStart=/usr/bin/python3 /opt/pypilot-status/pypilot-status.py
 Restart=always
 RestartSec=5
 
-# Allow binding port 80 without being root
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
 [Install]
 WantedBy=multi-user.target

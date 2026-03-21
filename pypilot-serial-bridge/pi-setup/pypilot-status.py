@@ -2,10 +2,11 @@
 """
 pypilot-status.py — PyPilot Autopilot System Status Monitor
 ============================================================
-Runs a live web dashboard at http://pypilotstatus.local (port 80)
+Runs a live web dashboard at http://pypilotstatus.local:8083
 that continuously checks every layer of the autopilot stack.
 
-Registers the mDNS hostname 'pypilotstatus.local' via avahi-publish-address.
+mDNS hostname 'pypilotstatus.local' is advertised by avahi-daemon via
+/etc/avahi/services/pypilot-status.xml (created by setup-bridge.sh).
 All checks use only Python stdlib + subprocess calls to system tools.
 
 Install:  see setup-bridge.sh
@@ -26,13 +27,13 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ── Configuration ──────────────────────────────────────────────────────────
-PORT            = 80
+PORT            = 8083
 CHECK_INTERVAL  = 10          # seconds between full check cycles
 MDNS_HOSTNAME   = "pypilotstatus"
 BRIDGE_HOST     = "pypilot-bridge.local"
 BRIDGE_PORT     = 20220
 COMPASS_HOST    = "compass.local"
-PYPILOT_PORT    = 23322
+PYPILOT_PORT    = 20220
 SK_PORT         = 3000
 SERVO_DEV       = "/dev/pypilot-servo"
 HOME            = os.path.expanduser("~")
@@ -41,7 +42,6 @@ PYPILOT_DIR     = os.path.join(HOME, "pypilot")
 
 _lock   = threading.Lock()
 _state  = {"layers": [], "summary": {}, "last_check": None, "check_count": 0}
-_avahi  = None   # avahi-publish-address subprocess handle
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -65,17 +65,26 @@ def svc_active(name):
 
 
 def tcp_open(host, port, timeout=3):
+    """Return True if port is open (accepting) OR occupied (timeout = server busy with one client).
+    Only return False on ConnectionRefused, which means nothing is listening."""
     try:
         s = socket.create_connection((host, port), timeout=timeout)
         s.close()
         return True
-    except Exception:
+    except ConnectionRefusedError:
         return False
+    except Exception:
+        # TimeoutError = server is up but backlog full (single-client bridge already connected)
+        # OSError / other = treat as open-but-busy rather than missing
+        return True
 
 
-def http_get(url, timeout=5):
+def http_get(url, timeout=5, token=None):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "pypilot-status/1"})
+        headers = {"User-Agent": "pypilot-status/1"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read().decode("utf-8", errors="replace"), r.status
     except Exception:
@@ -83,11 +92,8 @@ def http_get(url, timeout=5):
 
 
 def ping(host, timeout=3):
-    r = subprocess.run(
-        ["ping", "-c1", f"-W{timeout}", host],
-        capture_output=True, timeout=timeout + 2,
-    )
-    return r.returncode == 0
+    """Check host reachability via TCP port 80 (avoids ICMP permission issues in service context)."""
+    return tcp_open(host, 80, timeout=timeout)
 
 
 def age_secs(timestamp_str):
@@ -107,6 +113,34 @@ def read_file(path):
         return ""
 
 
+def pypilot_heading(timeout=2.0):
+    """Connect to pypilot IPC (port 20220), read NMEA stream, return heading in degrees or None."""
+    try:
+        s = socket.create_connection(("localhost", PYPILOT_PORT), timeout=timeout)
+        s.settimeout(timeout)
+        buf = b""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            try:
+                chunk = s.recv(256)
+                if not chunk:
+                    break
+                buf += chunk
+                for line in buf.split(b"\n"):
+                    line = line.strip()
+                    if line.startswith(b"$APHDM,"):
+                        parts = line.decode("ascii", errors="ignore").split(",")
+                        if len(parts) >= 2 and parts[1]:
+                            s.close()
+                            return float(parts[1])
+            except socket.timeout:
+                break
+        s.close()
+    except Exception:
+        pass
+    return None
+
+
 # ── Layer checks ─────────────────────────────────────────────────────────────
 
 def check_layer1():
@@ -114,6 +148,9 @@ def check_layer1():
     checks = []
     failed = False
     warned = False
+
+    # Auth token that pypilot uses for its SK WebSocket subscription
+    sk_token = read_file(os.path.join(HOME, ".pypilot", "signalk-token")).strip()
 
     if svc_active("signalk.service"):
         checks.append(("ok", "signalk.service running"))
@@ -129,7 +166,8 @@ def check_layer1():
         failed = True
 
     body, _ = http_get(
-        f"http://localhost:{SK_PORT}/signalk/v1/api/vessels/self/navigation/headingMagnetic"
+        f"http://localhost:{SK_PORT}/signalk/v1/api/vessels/self/navigation/headingMagnetic",
+        token=sk_token
     )
     if body:
         try:
@@ -153,7 +191,8 @@ def check_layer1():
         failed = True
 
     body, _ = http_get(
-        f"http://localhost:{SK_PORT}/signalk/v1/api/vessels/self/navigation/rateOfTurn"
+        f"http://localhost:{SK_PORT}/signalk/v1/api/vessels/self/navigation/rateOfTurn",
+        token=sk_token
     )
     if body:
         checks.append(("ok", "navigation.rateOfTurn present"))
@@ -196,8 +235,8 @@ def check_layer2():
     status = "fail" if failed else ("warn" if warned else "ok")
     return {
         "name": "ESP32-S3 BNO085 Compass",
-        "subtitle": f"20 Hz heading sensor — {COMPASS_HOST}",
-        "timing": "50 ms cycle: sensor→WiFi UDP→Signal K (~100 ms end-to-end this hop)",
+        "subtitle": f"40 Hz heading sensor — {COMPASS_HOST}",
+        "timing": "25 ms cycle (40 Hz): sensor→WiFi UDP→Signal K (~2–5 ms WiFi hop)",
         "status": status,
         "checks": checks,
         "links": [
@@ -256,10 +295,10 @@ def check_layer4():
         failed = True
 
     svc_content = read_file("/etc/systemd/system/pypilot-bridge.service")
-    if "retry=forever" in svc_content:
-        checks.append(("ok", "socat configured with retry=forever"))
+    if "retry=2147483647" in svc_content or "retry=forever" in svc_content:
+        checks.append(("ok", "socat configured with infinite retry"))
     elif svc_content:
-        checks.append(("warn", "socat NOT using retry=forever — will give up reconnecting"))
+        checks.append(("warn", "socat NOT using retry=2147483647 — will give up reconnecting"))
         warned = True
 
     if "StartLimitIntervalSec=0" in svc_content:
@@ -314,10 +353,15 @@ def check_layer5():
         checks.append(("fail", "pypilot.service NOT running"))
         failed = True
 
-    if tcp_open("localhost", PYPILOT_PORT):
-        checks.append(("ok", f"PyPilot JSON server on TCP :{PYPILOT_PORT}"))
+    # Verify pypilot is receiving heading by reading its live NMEA output
+    hdg = pypilot_heading()
+    if hdg is not None:
+        checks.append(("ok", f"imu.heading = {hdg:.1f}° (heading arriving via Signal K)"))
+    elif tcp_open("localhost", PYPILOT_PORT, timeout=1):
+        checks.append(("warn", f"pypilot TCP :{PYPILOT_PORT} open but no heading in NMEA stream"))
+        warned = True
     else:
-        checks.append(("fail", f"PyPilot TCP :{PYPILOT_PORT} not open"))
+        checks.append(("fail", f"pypilot TCP :{PYPILOT_PORT} not open"))
         failed = True
 
     # Read imu.source from conf file (fast, no pypilot client dep)
@@ -343,7 +387,7 @@ def check_layer5():
     return {
         "name": "PyPilot Autopilot",
         "subtitle": f"6-term PID — TCP :{PYPILOT_PORT} — imu.source = {imu_src}",
-        "timing": "~545 ms command cycle (servo.period = 0.5455 s)",
+        "timing": "25 ms PID cycle (imu.rate=40) — ~60 ms total chain latency",
         "status": status,
         "checks": checks,
         "links": [
@@ -603,40 +647,29 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
 
-# ── mDNS via avahi-publish-address ───────────────────────────────────────────
+# ── mDNS via avahi service file ──────────────────────────────────────────────
 
-def start_mdns():
-    """Register pypilotstatus.local via avahi-publish-address (runs as child process)."""
-    ip = local_ip()
-    print(f"[mDNS] Registering {MDNS_HOSTNAME}.local → {ip}", flush=True)
-    try:
-        proc = subprocess.Popen(
-            ["avahi-publish-address", "-R", MDNS_HOSTNAME, ip],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return proc
-    except FileNotFoundError:
-        print("[mDNS] avahi-publish-address not found — install avahi-utils", flush=True)
-        return None
-    except Exception as e:
-        print(f"[mDNS] Failed to start: {e}", flush=True)
-        return None
+AVAHI_SERVICE_FILE = "/etc/avahi/services/pypilot-status.service"
+
+def check_mdns():
+    """Verify the avahi service file is installed (created by setup-bridge.sh)."""
+    if os.path.exists(AVAHI_SERVICE_FILE):
+        print(f"[mDNS] {MDNS_HOSTNAME}.local:{PORT} advertised via {AVAHI_SERVICE_FILE}", flush=True)
+    else:
+        print(f"[mDNS] WARNING: {AVAHI_SERVICE_FILE} not found.", flush=True)
+        print(f"[mDNS] Run setup-bridge.sh to create it, or:", flush=True)
+        print(f"[mDNS]   sudo avahi-publish -a {MDNS_HOSTNAME} <ip>", flush=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _avahi
+    # Check mDNS service file
+    check_mdns()
 
-    # Start mDNS registration
-    _avahi = start_mdns()
-
-    # Signal handlers to clean up mDNS on exit
+    # Signal handlers
     def shutdown(sig, frame):
         print("\n[pypilot-status] Shutting down...", flush=True)
-        if _avahi and _avahi.poll() is None:
-            _avahi.terminate()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
@@ -661,7 +694,7 @@ def main():
     # Start HTTP server
     server = http.server.HTTPServer(("", PORT), StatusHandler)
     host_ip = local_ip()
-    print(f"[pypilot-status] Serving on http://{MDNS_HOSTNAME}.local  "
+    print(f"[pypilot-status] Serving on http://{MDNS_HOSTNAME}.local:{PORT}  "
           f"(http://{host_ip}:{PORT})", flush=True)
     print(f"[pypilot-status] Checking every {CHECK_INTERVAL}s", flush=True)
     server.serve_forever()

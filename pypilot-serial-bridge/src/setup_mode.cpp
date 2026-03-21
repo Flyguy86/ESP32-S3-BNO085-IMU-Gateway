@@ -17,6 +17,7 @@
 #include <ESPmDNS.h>
 #include <ESPAsyncWebServer.h>
 #include <NimBLEDevice.h>
+#include <esp_mac.h>
 
 // ---------------------------------------------------------------------------
 // Forward declarations

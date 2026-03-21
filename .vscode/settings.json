@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python3 -c \"\nimport serial, time\ns = serial\\.Serial\\('/dev/ttyACM1', 115200, timeout=2\\)\nstart = time\\.time\\(\\)\nwhile time\\.time\\(\\) - start < 12:\n    line = s\\.readline\\(\\)\\.decode\\('utf-8', errors='replace'\\)\\.strip\\(\\)\n    if line:\n        print\\(line\\)\ns\\.close\\(\\)\n\" 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "lsusb": true
+    }
+}

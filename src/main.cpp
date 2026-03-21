@@ -62,10 +62,30 @@ struct Config {
   bool     configured = false;
   String   wifiSSID;
   String   wifiPass;
-  char     mdnsName[32] = "s3imu";
+  char     mdnsName[32] = "compass";
   uint16_t signalkPort  = 10110;
   float    compassOffset = 0.0f;   // degrees, added to raw heading
 } cfg;
+
+// ---- Heading Stability (runtime-adjustable) ----
+#define DRIFT_HISTORY_MAX 120  // max seconds for drift window
+
+static float    filterAlpha       = 0.005f;  // Mag correction rate (0=gyro-only, 1=mag-only)
+static int      driftWindowSec    = 60;      // Drift rate measured over this window
+static int      magTrustThreshold = 2;       // Min magAcc (0-3) to trust mag heading
+static bool     useCompFilter     = true;    // Enable complementary filter (false=game-vector only)
+static bool     useMagHeading     = false;   // Use raw mag heading instead of filter
+
+static bool     calibrationActive = false;   // true while user-initiated cal running
+static float    gameHeading   = 0.0f;        // Gyro-stabilized heading (no mag)
+static float    magHeading    = 0.0f;        // Raw magnetic heading
+static float    rotVecHeading = 0.0f;        // BNO085 rotation vector heading (mag-fused)
+static float    filteredHeading = 0.0f;      // Blended output
+static float    driftRate     = 0.0f;        // degrees/min drift
+static float    headingHistory[DRIFT_HISTORY_MAX]; // 1Hz samples for drift calc
+static int      historyIdx    = 0;
+static bool     historyFull   = false;
+static uint32_t lastHistorySample = 0;
 
 void loadConfig() {
   prefs.begin("config", false);
@@ -74,8 +94,16 @@ void loadConfig() {
   cfg.wifiPass      = prefs.getString("pass", "");
   cfg.signalkPort   = prefs.getUShort("skport", 10110);
   cfg.compassOffset = prefs.getFloat("compoff", 0.0f);
-  String name       = prefs.getString("mdns", "s3imu");
+  String name       = prefs.getString("mdns", "compass");
   name.toCharArray(cfg.mdnsName, sizeof(cfg.mdnsName));
+  // Compass filter settings
+  filterAlpha       = prefs.getFloat("fAlpha", 0.005f);
+  driftWindowSec    = prefs.getInt("driftWin", 60);
+  magTrustThreshold = prefs.getInt("magTrust", 2);
+  useCompFilter     = prefs.getBool("useComp", true);
+  useMagHeading     = prefs.getBool("useMag", false);
+  if (driftWindowSec < 5) driftWindowSec = 5;
+  if (driftWindowSec > DRIFT_HISTORY_MAX) driftWindowSec = DRIFT_HISTORY_MAX;
 }
 void saveConfig() {
   prefs.putBool("configured", cfg.configured);
@@ -84,6 +112,12 @@ void saveConfig() {
   prefs.putUShort("skport", cfg.signalkPort);
   prefs.putFloat("compoff", cfg.compassOffset);
   prefs.putString("mdns", String(cfg.mdnsName));
+  // Compass filter settings
+  prefs.putFloat("fAlpha", filterAlpha);
+  prefs.putInt("driftWin", driftWindowSec);
+  prefs.putInt("magTrust", magTrustThreshold);
+  prefs.putBool("useComp", useCompFilter);
+  prefs.putBool("useMag", useMagHeading);
 }
 void resetConfig() {
   prefs.clear();
@@ -98,6 +132,9 @@ struct IMUData {
   float gx, gy, gz;
   float lax, lay, laz;
   byte quatAcc, magAcc;
+  float magH;        // raw magnetic heading for diagnostics
+  float gameH;       // game rotation heading
+  float driftDegMin; // heading drift in deg/min
 } currentData;
 
 // =====================================================================
@@ -142,7 +179,7 @@ static const char SETUP_HTML[] PROGMEM = R"rawliteral(
   <input name="pass" type="password" placeholder="Password">
 
   <label>Device Name (mDNS)</label>
-  <input name="mdns" value="s3imu" pattern="[a-z0-9\-]+" maxlength="24"
+  <input name="mdns" value="compass" pattern="[a-z0-9\-]+" maxlength="24"
          title="Lowercase letters, numbers, and hyphens only">
   <div class="info">Accessible as <em>name</em>.local after connecting</div>
 
@@ -228,6 +265,12 @@ static const char DASH_HTML[] PROGMEM = R"rawliteral(
   .btn-red{background:#e74c3c;color:#fff}
   .btn-green{background:#2ecc71;color:#1a1a2e}
   .info{color:#888;font-size:0.85em}
+  .sw{position:relative;display:inline-block;width:40px;height:22px;vertical-align:middle;margin-right:6px}
+  .sw input{opacity:0;width:0;height:0}
+  .sl{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#444;border-radius:22px;transition:.3s}
+  .sl:before{content:"";position:absolute;height:16px;width:16px;left:3px;bottom:3px;background:#ccc;border-radius:50%%;transition:.3s}
+  .sw input:checked+.sl{background:#2ecc71}
+  .sw input:checked+.sl:before{transform:translateX(18px)}
 </style>
 </head><body>
 <h1>&#9875; BNO085 IMU Gateway</h1>
@@ -238,6 +281,10 @@ static const char DASH_HTML[] PROGMEM = R"rawliteral(
   <tr><td>Rate of Turn</td><td><span id="rot">--</span>&deg;/s</td></tr>
   <tr><td>Quat Accuracy</td><td><span id="qa">0</span>/3</td></tr>
   <tr><td>Mag Accuracy</td><td><span id="ma">0</span>/3</td></tr>
+  <tr><td>Mag Heading</td><td><span id="mh">--</span>&deg;</td></tr>
+  <tr><td>Game Heading</td><td><span id="gh">--</span>&deg;</td></tr>
+  <tr><td>Drift Rate</td><td><span id="dr">--</span>&deg;/min</td></tr>
+  <tr><td>Calibration</td><td><span id="cs">Off</span></td></tr>
   <tr><td>IP Address</td><td>%IP%</td></tr>
   <tr><td>mDNS</td><td><a href="http://%MDNS%.local" style="color:#0fbcf9">%MDNS%.local</a></td></tr>
   <tr><td>Signal K Port</td><td>%SKPORT% (UDP)</td></tr>
@@ -256,15 +303,66 @@ static const char DASH_HTML[] PROGMEM = R"rawliteral(
   <div id="ps" class="info"></div>
 </div>
 <div class="section">
-  <b>Compass Offset</b><br>
+  <b>Set Heading</b> <span class="info">(enter your real heading after boot)</span><br>
+  <input id="realhdg" type="number" min="0" max="360" step="1" value="0">
+  <span class="info">&deg;</span>
+  <button class="btn-blue" onclick="setHeading()">Set Heading</button>
+  <div id="hs" class="info"></div>
+</div>
+<div class="section">
+  <b>Compass Offset</b> <span class="info">(auto-set by Set Heading)</span><br>
   <input id="compoff" type="number" min="-180" max="180" step="0.1" value="%COMPOFF%">
   <span class="info">&deg;</span>
   <button class="btn-blue" onclick="setOffset()">Set</button>
   <div id="os" class="info"></div>
 </div>
 <div class="section">
+  <b>Compass Filter Settings</b>
+  <table>
+    <tr>
+      <td>Comp. Filter</td>
+      <td>
+        <label class="sw"><input type="checkbox" id="useComp" %USECOMP% onchange="setFilter()"><span class="sl"></span></label>
+        <span class="info">Blend mag + gyro</span>
+      </td>
+    </tr>
+    <tr>
+      <td>Mag-Only Mode</td>
+      <td>
+        <label class="sw"><input type="checkbox" id="useMag" %USEMAG% onchange="setFilter()"><span class="sl"></span></label>
+        <span class="info">Use raw mag heading</span>
+      </td>
+    </tr>
+    <tr>
+      <td>Filter Alpha</td>
+      <td>
+        <input id="fAlpha" type="number" min="0" max="1" step="0.001" value="%FALPHA%" style="width:80px">
+        <span class="info">0=gyro, 1=mag</span>
+      </td>
+    </tr>
+    <tr>
+      <td>Mag Trust</td>
+      <td>
+        <input id="magTrust" type="number" min="0" max="3" step="1" value="%MAGTRUST%" style="width:60px">
+        <span class="info">/3 min accuracy</span>
+      </td>
+    </tr>
+    <tr>
+      <td>Drift Window</td>
+      <td>
+        <input id="driftWin" type="number" min="5" max="120" step="1" value="%DRIFTWIN%" style="width:60px">
+        <span class="info">sec</span>
+      </td>
+    </tr>
+  </table>
+  <button class="btn-blue" onclick="setFilter()">Apply</button>
+  <div id="fs" class="info"></div>
+</div>
+<div class="section">
+  <button class="btn-blue" onclick="fetch('/startcal').then(r=>r.text()).then(t=>alert(t))">
+    Start Calibration</button>
   <button class="btn-green" onclick="fetch('/savecal').then(r=>r.text()).then(t=>alert(t))">
-    Save Calibration</button>
+    Save &amp; Lock Calibration</button>
   <button class="btn-red" onclick="if(confirm('Reset WiFi and settings?'))fetch('/reset')">
     Factory Reset</button>
 </div>
@@ -278,6 +376,10 @@ s.onmessage=function(e){
   document.getElementById('rot').innerHTML=d.rot.toFixed(2);
   document.getElementById('qa').innerHTML=d.qacc;
   document.getElementById('ma').innerHTML=d.macc;
+  if(d.mh!==undefined) document.getElementById('mh').innerHTML=d.mh.toFixed(1);
+  if(d.gh!==undefined) document.getElementById('gh').innerHTML=d.gh.toFixed(1);
+  if(d.dr!==undefined){var dr=document.getElementById('dr');dr.innerHTML=d.dr.toFixed(2);dr.style.color=Math.abs(d.dr)>0.5?'#e74c3c':'#2ecc71';}
+  if(d.cs!==undefined) document.getElementById('cs').innerHTML=d.cs?'<span style="color:#e74c3c">Active</span>':'Off';
 };
 function setName(){
   fetch('/setname?name='+document.getElementById('name').value)
@@ -288,53 +390,239 @@ function setPort(){
     .then(r=>r.text()).then(t=>{document.getElementById('ps').innerHTML=t;
     setTimeout(()=>document.getElementById('ps').innerHTML='',3000)});
 }
+function setHeading(){
+  fetch('/setheading?hdg='+document.getElementById('realhdg').value)
+    .then(r=>r.json()).then(d=>{
+      document.getElementById('hs').innerHTML=d.msg;
+      document.getElementById('compoff').value=d.offset.toFixed(1);
+      setTimeout(()=>document.getElementById('hs').innerHTML='',5000);
+    });
+}
 function setOffset(){
   fetch('/setoffset?val='+document.getElementById('compoff').value)
     .then(r=>r.text()).then(t=>{document.getElementById('os').innerHTML=t;
     setTimeout(()=>document.getElementById('os').innerHTML='',3000)});
+}
+function setFilter(){
+  var p='useComp='+(document.getElementById('useComp').checked?1:0)
+    +'&useMag='+(document.getElementById('useMag').checked?1:0)
+    +'&alpha='+document.getElementById('fAlpha').value
+    +'&magTrust='+document.getElementById('magTrust').value
+    +'&driftWin='+document.getElementById('driftWin').value;
+  fetch('/setfilter?'+p).then(r=>r.text()).then(t=>{document.getElementById('fs').innerHTML=t;
+    setTimeout(()=>document.getElementById('fs').innerHTML='',3000)});
 }
 </script>
 </body></html>
 )rawliteral";
 
 static String dashProcessor(const String& var) {
-  if (var == "IP")      return WiFi.localIP().toString();
-  if (var == "MDNS")    return String(cfg.mdnsName);
-  if (var == "SKPORT")  return String(cfg.signalkPort);
-  if (var == "COMPOFF") return String(cfg.compassOffset, 1);
+  if (var == "IP")       return WiFi.localIP().toString();
+  if (var == "MDNS")     return String(cfg.mdnsName);
+  if (var == "SKPORT")   return String(cfg.signalkPort);
+  if (var == "COMPOFF")  return String(cfg.compassOffset, 1);
+  if (var == "FALPHA")   return String(filterAlpha, 3);
+  if (var == "MAGTRUST") return String(magTrustThreshold);
+  if (var == "DRIFTWIN") return String(driftWindowSec);
+  if (var == "USECOMP")  return useCompFilter ? "checked" : "";
+  if (var == "USEMAG")   return useMagHeading ? "checked" : "";
   return String();
 }
 
 // =====================================================================
 // Sensor Task — Core 1, high priority
 // =====================================================================
+// Wrap angle to 0-360
+static float wrapHeading(float deg) {
+  while (deg >= 360.0f) deg -= 360.0f;
+  while (deg < 0.0f)    deg += 360.0f;
+  return deg;
+}
+
+// Shortest signed angular difference (a - b), result in -180..+180
+static float angleDiff(float a, float b) {
+  float d = a - b;
+  while (d > 180.0f)  d -= 360.0f;
+  while (d < -180.0f) d += 360.0f;
+  return d;
+}
+
+// Update drift rate tracking (called ~1Hz)
+static void updateDriftTracking(float heading) {
+  uint32_t now = millis();
+  if (now - lastHistorySample < 1000) return;
+  lastHistorySample = now;
+
+  headingHistory[historyIdx] = heading;
+  historyIdx = (historyIdx + 1) % driftWindowSec;
+  if (historyIdx == 0) historyFull = true;
+
+  if (historyFull) {
+    int oldest = historyIdx;
+    float totalDrift = angleDiff(heading, headingHistory[oldest]);
+    driftRate = totalDrift / (driftWindowSec / 60.0f); // deg/min
+  }
+}
+
+// Compute yaw from quaternion components (returns degrees)
+static float quatToYaw(float qi, float qj, float qk, float qr) {
+  float siny_cosp = 2.0f * (qr * qk + qi * qj);
+  float cosy_cosp = 1.0f - 2.0f * (qj * qj + qk * qk);
+  return atan2(siny_cosp, cosy_cosp) * 180.0f / PI;
+}
+
+// =====================================================================
+// BNO085 report enable — called on boot and after any reinit
+// =====================================================================
+static void initIMUReports() {
+  myIMU.enableGameRotationVector(25);         delay(50);  // 40 Hz
+  myIMU.enableRotationVector(50);             delay(50);  // 20 Hz (drift-correction reference only)
+  myIMU.enableGyro(25);                       delay(50);  // 40 Hz
+  myIMU.enableLinearAccelerometer(25);        delay(50);  // 40 Hz
+  // Let BNO085 dynamically calibrate magnetometer — do NOT call endCalibration()
+}
+
 void sensorTask(void * pvParameters) {
-  myIMU.enableRotationVector(100);   delay(50);
-  myIMU.enableGyro(100);             delay(50);
-  myIMU.enableLinearAccelerometer(100); delay(50);
-  myIMU.enableMagnetometer(500);     delay(50);
-  myIMU.calibrateAll();
+  initIMUReports();
+
+  bool firstReading = true;
+  float prevGameHeading = 0.0f;
+  float rotVecQuality = 0;       // quatAcc from rotation vector (0-3)
+  uint32_t lastSerialPrint = 0;
+  uint32_t lastGoodData = millis(); // watchdog: last time we got a valid SHTP packet
+  bool calSavedThisBoot = false;   // auto-save BNO085 cal once per boot when quatAcc=3
 
   for (;;) {
-    while (myIMU.dataAvailable()) {
-      float rawYaw = myIMU.getYaw() * 180.0 / PI;
-      float adjusted = ((rawYaw < 0) ? rawYaw + 360.0 : rawYaw) + cfg.compassOffset;
-      // Wrap to 0-360
-      if (adjusted >= 360.0) adjusted -= 360.0;
-      else if (adjusted < 0.0) adjusted += 360.0;
-      currentData.h = adjusted;
-      currentData.p = myIMU.getPitch() * 180.0 / PI;
-      currentData.r = myIMU.getRoll() * 180.0 / PI;
-      currentData.gx = myIMU.getGyroX() * 180.0 / PI;
-      currentData.gy = myIMU.getGyroY() * 180.0 / PI;
-      currentData.gz = myIMU.getGyroZ() * 180.0 / PI;
-      currentData.rot = currentData.gz;
-      currentData.lax = myIMU.getLinAccelX();
-      currentData.lay = myIMU.getLinAccelY();
-      currentData.laz = myIMU.getLinAccelZ();
-      currentData.quatAcc = myIMU.getQuatAccuracy();
-      currentData.magAcc = myIMU.getMagAccuracy();
+    // BNO085 spontaneous reset (power glitch, brown-out) — re-enable reports without I2C reinit
+    if (myIMU.hasReset()) {
+      Serial.println("[IMU] BNO085 reset detected — re-enabling reports");
+      Serial0.println("[IMU] BNO085 reset detected — re-enabling reports");
+      initIMUReports();
+      firstReading = true;
+      lastGoodData = millis();
     }
+
+    while (myIMU.dataAvailable()) {
+      lastGoodData = millis();
+      uint8_t reportID = myIMU.shtpData[5];
+
+      if (reportID == SENSOR_REPORTID_ROTATION_VECTOR) {
+        // Mag-fused heading — absolute reference (may be noisy initially)
+        float qi = myIMU.getQuatI();
+        float qj = myIMU.getQuatJ();
+        float qk = myIMU.getQuatK();
+        float qr = myIMU.getQuatReal();
+        float rawYaw = quatToYaw(qi, qj, qk, qr);
+        float rawDeg = rawYaw < 0 ? rawYaw + 360.0f : rawYaw;
+        rotVecHeading = rawDeg;
+        rotVecQuality = myIMU.getQuatAccuracy();
+        currentData.quatAcc = rotVecQuality;
+
+        // Auto-save calibration to BNO085 flash once per boot when mag is fully calibrated
+        if (rotVecQuality >= 3 && !calSavedThisBoot) {
+          myIMU.saveCalibration();
+          calSavedThisBoot = true;
+          Serial.println("[CAL] quatAcc=3 — calibration auto-saved to BNO085 flash");
+          Serial0.println("[CAL] quatAcc=3 — calibration auto-saved to BNO085 flash");
+        }
+      }
+      else if (reportID == SENSOR_REPORTID_GAME_ROTATION_VECTOR) {
+        // Game vector — smooth tracking, compute delta for complementary filter
+        float qi = myIMU.getQuatI();
+        float qj = myIMU.getQuatJ();
+        float qk = myIMU.getQuatK();
+        float qr = myIMU.getQuatReal();
+        float rawYaw = quatToYaw(qi, qj, qk, qr);
+        float rawDeg = rawYaw < 0 ? rawYaw + 360.0f : rawYaw;
+        gameHeading = rawDeg;
+
+        // Pitch/roll from game rotation quaternion
+        currentData.p = myIMU.getPitch() * 180.0f / PI;
+        currentData.r = myIMU.getRoll()  * 180.0f / PI;
+
+        if (firstReading) {
+          filteredHeading = gameHeading;
+          prevGameHeading = gameHeading;
+          firstReading = false;
+        } else {
+          // Track rotation via game vector delta (smooth, no mag noise)
+          float gameDelta = angleDiff(gameHeading, prevGameHeading);
+          prevGameHeading = gameHeading;
+          filteredHeading = wrapHeading(filteredHeading + gameDelta);
+
+          // Slowly correct toward rotation vector heading when mag quality is good
+          // quatAcc: 0=unreliable, 1=low, 2=medium, 3=high
+          if (rotVecQuality >= 2) {
+            // Rotation vector heading with same offset as our filtered heading
+            float rotRef = wrapHeading(rotVecHeading + cfg.compassOffset);
+            float filtered = wrapHeading(filteredHeading + cfg.compassOffset);
+            float error = angleDiff(rotRef, filtered);
+            // Gentle correction — 0.002 = ~0.2% per 100ms, prevents sudden jumps
+            filteredHeading = wrapHeading(filteredHeading + error * 0.002f);
+          }
+        }
+
+        // Final heading = filtered heading + user offset
+        float finalHeading = wrapHeading(filteredHeading + cfg.compassOffset);
+        currentData.h     = finalHeading;
+        currentData.gameH = gameHeading;
+
+        // Drift tracking (1Hz sampling)
+        updateDriftTracking(finalHeading);
+        currentData.driftDegMin = driftRate;
+
+        // Serial debug output ~1Hz
+        uint32_t now = millis();
+        if (now - lastSerialPrint >= 1000) {
+          lastSerialPrint = now;
+          char dbg[300];
+          snprintf(dbg, sizeof(dbg),
+            "[HDG] final=%.1f  game=%.1f  rotVec=%.1f  filtered=%.1f  offset=%.1f  "
+            "quatAcc=%d  drift=%.2f°/min  pitch=%.1f  roll=%.1f",
+            finalHeading, gameHeading, rotVecHeading, filteredHeading,
+            cfg.compassOffset, (int)rotVecQuality, driftRate,
+            currentData.p, currentData.r);
+          Serial.println(dbg);
+          Serial0.println(dbg);
+        }
+      }
+      else if (reportID == SENSOR_REPORTID_GYROSCOPE) {
+        currentData.gx  = myIMU.getGyroX() * 180.0f / PI;
+        currentData.gy  = myIMU.getGyroY() * 180.0f / PI;
+        currentData.gz  = myIMU.getGyroZ() * 180.0f / PI;
+        currentData.rot = currentData.gz;
+      }
+      else if (reportID == SENSOR_REPORTID_LINEAR_ACCELERATION) {
+        currentData.lax = myIMU.getLinAccelX();
+        currentData.lay = myIMU.getLinAccelY();
+        currentData.laz = myIMU.getLinAccelZ();
+      }
+    }
+
+    // Stale-data watchdog: if no valid SHTP packet in 500 ms the I2C bus or BNO085 is stuck.
+    // Wire.setTimeOut(100) means requestFrom() has already given up after 100 ms —
+    // so reaching here means the library returned false for several consecutive poll cycles.
+    if (millis() - lastGoodData > 500) {
+      Serial.println("[IMU] No data for 500 ms — reinitializing I2C + BNO085");
+      Serial0.println("[IMU] No data for 500 ms — reinitializing I2C + BNO085");
+      Wire.end();
+      vTaskDelay(pdMS_TO_TICKS(20));
+      Wire.begin(SDA_PIN, SCL_PIN);
+      Wire.setClock(400000);
+      Wire.setTimeOut(100);
+      if (myIMU.begin()) {
+        initIMUReports();
+        firstReading = true;
+        Serial.println("[IMU] Reinit OK");
+        Serial0.println("[IMU] Reinit OK");
+      } else {
+        Serial.println("[IMU] Reinit FAILED — will retry in 1 s");
+        Serial0.println("[IMU] Reinit FAILED — will retry in 1 s");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+      }
+      lastGoodData = millis();
+    }
+
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
@@ -384,7 +672,11 @@ void commsTask(void * pvParameters) {
                        ",\"lay\":" + String(currentData.lay, 3) +
                        ",\"laz\":" + String(currentData.laz, 3) +
                        ",\"qacc\":" + String(currentData.quatAcc) +
-                       ",\"macc\":" + String(currentData.magAcc) + "}";
+                       ",\"macc\":" + String(currentData.magAcc) +
+                       ",\"mh\":" + String(currentData.magH, 1) +
+                       ",\"gh\":" + String(currentData.gameH, 1) +
+                       ",\"dr\":" + String(currentData.driftDegMin, 2) +
+                       ",\"cs\":" + String(calibrationActive ? 1 : 0) + "}";
 
       if (wifiOk) {
         udp.beginPacket("255.255.255.255", 4210);
@@ -398,7 +690,7 @@ void commsTask(void * pvParameters) {
       pCharacteristic->notify();
       xSemaphoreGive(radioMutex);
     }
-    vTaskDelay(pdMS_TO_TICKS(500));  // 2 Hz
+    vTaskDelay(pdMS_TO_TICKS(25));  // 40 Hz
   }
 }
 
@@ -554,7 +846,7 @@ void startBridgeMode() {
     Serial.printf("\n[WIFI] Connected — IP %s\n", WiFi.localIP().toString().c_str());
     if (MDNS.begin(cfg.mdnsName)) {
       MDNS.addService("http", "tcp", 80);
-      MDNS.addServiceTxt("http", "tcp", "swname", "s3imu-gateway");
+      MDNS.addServiceTxt("http", "tcp", "swname", "compass-gateway");
       MDNS.addServiceTxt("http", "tcp", "txtvers", "1");
       MDNS.addServiceTxt("http", "tcp", "path", "/");
       Serial.printf("[mDNS] http://%s.local\n", cfg.mdnsName);
@@ -570,6 +862,7 @@ void startBridgeMode() {
   setLED(RGB_BRIGHTNESS, RGB_BRIGHTNESS/2, 0);  // Yellow
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
+  Wire.setTimeOut(100); // 100 ms hardware I2C timeout — prevents indefinite blocking if BNO085 holds SDA low
   if (!myIMU.begin()) {
     Serial.println("[IMU] BNO085 not detected! Check SDA=GPIO8, SCL=GPIO9");
     while (1) { flashLED(RGB_BRIGHTNESS, 0, 0, 1, 500); }
@@ -625,6 +918,21 @@ void startBridgeMode() {
     saveConfig();
     req->send(200, "text/plain", "Port set to " + String(p) + " (saved)");
   });
+  server.on("/setheading", HTTP_GET, [](AsyncWebServerRequest *req) {
+    if (!req->hasParam("hdg")) {
+      req->send(400, "text/plain", "Missing heading"); return;
+    }
+    float realHdg = req->getParam("hdg")->value().toFloat();
+    if (realHdg < 0.0f || realHdg > 360.0f) {
+      req->send(400, "text/plain", "Invalid (0-360)"); return;
+    }
+    float newOffset = realHdg - filteredHeading;
+    if (newOffset > 180.0f) newOffset -= 360.0f;
+    if (newOffset < -180.0f) newOffset += 360.0f;
+    cfg.compassOffset = newOffset;
+    saveConfig();
+    req->send(200, "application/json", "{\"msg\":\"Heading set to " + String(realHdg, 0) + "\u00B0 (offset=" + String(newOffset, 1) + "\u00B0)\",\"offset\":" + String(newOffset, 1) + "}");
+  });
   server.on("/setoffset", HTTP_GET, [](AsyncWebServerRequest *req) {
     if (!req->hasParam("val")) {
       req->send(400, "text/plain", "Missing value"); return;
@@ -637,9 +945,40 @@ void startBridgeMode() {
     saveConfig();
     req->send(200, "text/plain", "Offset set to " + String(off, 1) + "\u00B0 (saved)");
   });
+  server.on("/setfilter", HTTP_GET, [](AsyncWebServerRequest *req) {
+    if (req->hasParam("useComp"))
+      useCompFilter = req->getParam("useComp")->value().toInt() != 0;
+    if (req->hasParam("useMag"))
+      useMagHeading = req->getParam("useMag")->value().toInt() != 0;
+    if (req->hasParam("alpha")) {
+      float a = req->getParam("alpha")->value().toFloat();
+      if (a >= 0.0f && a <= 1.0f) filterAlpha = a;
+    }
+    if (req->hasParam("magTrust")) {
+      int t = req->getParam("magTrust")->value().toInt();
+      if (t >= 0 && t <= 3) magTrustThreshold = t;
+    }
+    if (req->hasParam("driftWin")) {
+      int w = req->getParam("driftWin")->value().toInt();
+      if (w >= 5 && w <= DRIFT_HISTORY_MAX) {
+        driftWindowSec = w;
+        historyIdx = 0; historyFull = false;  // reset drift tracking
+      }
+    }
+    saveConfig();
+    req->send(200, "text/plain", "Filter updated (saved)");
+  });
+  server.on("/startcal", HTTP_GET, [](AsyncWebServerRequest *req) {
+    calibrationActive = true;
+    myIMU.calibrateAll();
+    req->send(200, "text/plain", "Calibration started — rotate the sensor slowly in all directions.\nPress 'Save & Lock' when Mag Accuracy reaches 2 or 3.");
+  });
   server.on("/savecal", HTTP_GET, [](AsyncWebServerRequest *req) {
     myIMU.saveCalibration();
-    req->send(200, "text/plain", "Calibration saved to BNO085 flash");
+    delay(200);
+    calibrationActive = false;
+    // Do NOT call endCalibration() — it disables dynamic mag recalibration
+    req->send(200, "text/plain", "Calibration saved to BNO085 flash.\nDynamic calibration remains active.");
   });
   server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *req) {
     req->send(200, "text/plain", "Resetting...");
@@ -664,6 +1003,7 @@ void startBridgeMode() {
 // =====================================================================
 void setup() {
   Serial.begin(115200);
+  Serial0.begin(115200);  // CH340 UART for serial monitor
   delay(2000);
   Serial.println("\n=== BNO085 IMU Gateway Boot ===");
 

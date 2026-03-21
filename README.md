@@ -1,5 +1,7 @@
 # 🧭 ESP32-S3 BNO085 Marine IMU Gateway
 
+> **Version:** v1.3.0 — 2026-03-21
+
 A high-stability 9-DOF orientation system designed for **marine autopilot** compass heading. Bridges high-fidelity BNO085 sensor fusion data over **BLE**, **WiFi** (UDP + Web Dashboard), and **Signal K** (delta JSON). Built for the ESP32-S3-N16R8 with a dual-core architecture that separates critical sensor sampling from wireless communication.
 
 > **Primary Goal:** Provide a "fit and forget" heading sensor for boats where router reliability might be an issue. By combining the precision of the BNO085 with the dual-radio capabilities of the ESP32-S3, heading data reaches the helm even if the primary WiFi network fails.
@@ -248,7 +250,7 @@ HDG:  327.4°  P:   -2.5°  R:    1.2°  ROT:   -0.12°/s  Accel: [ 0.01,-0.03, 
 | Task | Core | Priority | Stack | Rate | Purpose |
 |------|------|----------|-------|------|---------|
 | `sensorTask` | 1 | 2 | 4096 B | 10 Hz polling | I2C reads from BNO085, updates shared `IMUData` struct |
-| `commsTask` | 0 | 1 | 4096 B | 2 Hz output | Formats JSON, sends via BLE + UDP + Signal K + SSE |
+| `commsTask` | 0 | 1 | 4096 B | 40 Hz output | Formats JSON, sends via BLE + UDP + Signal K + SSE |
 | `ledTask` | 0 | 0 | 2048 B | continuous | Non-blocking green pulse animation |
 
 ---
@@ -327,6 +329,489 @@ These are notes from the development process that may save time if you're buildi
 ├── CMakeLists.txt         # ESP-IDF cmake (optional)
 └── README.md
 ```
+
+---
+
+## Full System Setup & Operations
+
+This device is one component in a four-layer autopilot chain. This section covers the complete system — from first-time setup through at-sea troubleshooting.
+
+### System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ESP32-S3 BNO085 (this device)                                  │
+│  compass.local  •  40 Hz (25 ms commsTask cycle)                │
+│  sensorTask 40 Hz Core 1 → commsTask 40 Hz Core 0              │
+│  Signal K delta UDP broadcast → 255.255.255.255:101022  [40 Hz] │
+└───────────────────────┬─────────────────────────────────────────┘
+                        │ UDP broadcast  [~1–5 ms WiFi hop]
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Signal K Server  (signalk.service)                             │
+│  http://localhost:3000   •  systemd auto-start                  │
+│  Aggregates heading, GPS, wind, AIS, etc.                       │
+│  Pushes heading to PyPilot via WebSocket  [25 ms period]        │
+└───────────────────────┬─────────────────────────────────────────┘
+                        │ WebSocket (zeroconf discovered)  [25 ms — signalk.period=0.025]
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PyPilot Autopilot  (pypilot.service + pypilot-web.service)     │
+│  /home/brian/pypilot  •  TCP port 23322  •  Web UI port 8080   │
+│  6-term PID (P I D DD PR FF)  •  imu.source = signalk          │
+│  PID loop 40 Hz  [25 ms — imu.rate=40]                         │
+│  servo.period=0.1 — motor stiction windup window               │
+│  Sends 4-byte motor commands to /dev/pypilot-servo              │
+└───────────────────────┬─────────────────────────────────────────┘
+                        │ writes to /dev/pypilot-servo (PTY)  [<1 ms]
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  socat  (pypilot-bridge.service)                                │
+│  /dev/pypilot-servo  ←→  TCP → pypilot-bridge.local:20220      │
+│  retry=forever  •  keepalive 10/5/3  •  StartLimitIntervalSec=0│
+└───────────────────────┬─────────────────────────────────────────┘
+                        │ TCP WiFi  [~2–5 ms]
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  ESP32-C3 Motor Bridge  (pypilot-serial-bridge firmware)        │
+│  pypilot-bridge.local  •  TCP port 20220                        │
+│  UART1 GPIO 4 TX / GPIO 5 RX  •  38400 baud  [~1 ms per pkt]  │
+└───────────────────────┬─────────────────────────────────────────┘
+                        │ UART 38400 baud  [~1 ms / 4-byte packet]
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PyPilot Motor Controller (arduino_servo)                       │
+│  CRC-8 verified 4-byte packets  •  current/voltage/rudder FB   │
+└─────────────────────────────────────────────────────────────────┘
+
+  Total end-to-end latency (typical): ~60 ms
+  Dominant delays: SK WebSocket push 25 ms + PID cycle 25 ms
+
+  Note: servo.period is the motor stiction windup window, NOT the PID rate.
+  PID rate = 1/imu.rate = 1/40 = 25 ms. signalk.period = SK minPeriod = 25 ms.
+```
+
+> **System Status Dashboard:** `http://pypilotstatus.local` — live health monitor
+> for all layers, served by `pypilot-status.service`
+
+---
+
+### Services Reference
+
+| Service | What it does | Config file |
+|---------|-------------|-------------|
+| `signalk.service` | Signal K server — aggregates all sensor data | `~/.signalk/settings.json` |
+| `pypilot-bridge.service` | socat creates `/dev/pypilot-servo` PTY bridged over WiFi to ESP32-C3 | `/etc/systemd/system/pypilot-bridge.service` |
+| `pypilot.service` | Main autopilot process — PID, heading control, servo output | `/etc/systemd/system/pypilot.service` |
+| `pypilot-web.service` | Web UI for pypilot (port 8080) | `/etc/systemd/system/pypilot-web.service` |
+| `pypilot-status.service` | Status monitor web server — `http://pypilotstatus.local` (port 80) | `/etc/systemd/system/pypilot-status.service` |
+
+#### Useful service commands
+
+```bash
+# View status of all autopilot services at once
+systemctl status signalk pypilot-bridge pypilot pypilot-web
+
+# Restart a single service
+systemctl restart pypilot-bridge.service
+
+# Follow live log of a service
+journalctl -u pypilot-bridge.service -f
+journalctl -u pypilot.service -f
+
+# Fix a service stuck in 'failed' state (systemd hit its restart limit)
+systemctl reset-failed pypilot-bridge.service
+systemctl start pypilot-bridge.service
+
+# Restart everything in dependency order
+systemctl restart signalk.service
+sleep 3
+systemctl restart pypilot-bridge.service
+sleep 3
+systemctl restart pypilot.service pypilot-web.service
+```
+
+---
+
+### First-Time Setup Checklist
+
+#### 1. Signal K UDP Input for BNO085
+
+The ESP32-S3 broadcasts Signal K deltas over UDP. The Signal K server needs a matching UDP input on the same port.
+
+**Step 1** — Check what port the compass is broadcasting on. Visit **http://compass.local** and look for "Signal K Port" in the dashboard table (default: `10110`, configurable).
+
+**Step 2** — Open: **http://localhost:3000/admin/#/serverConfiguration/connections/-**  
+If a `Signal K (UDP)` input already exists, note its port. If the port doesn't match the compass, either:
+- Change the compass port: `http://compass.local/setport?port=EXISTING_SK_PORT`  
+  *(e.g. if Signal K has a delta input on port 101022: `http://compass.local/setport?port=101022`)*
+- Or add a new Signal K (UDP) input on the port the compass is using.
+
+> **Note:** If port `10110` is already used by an **NMEA 0183** GPS input, you must use a different port for the Signal K delta feed. Use a port like `10111` or `101022` and point the compass there.
+
+**Step 3** — Save & restart Signal K, then verify at **http://localhost:3000/admin/#/databrowser** — search `headingMagnetic` — should update live at ~40 Hz.
+
+**Quick check from terminal:**
+```bash
+curl -s "http://localhost:3000/signalk/v1/api/vessels/self/navigation/headingMagnetic"
+# Should return JSON with a recent timestamp and value in radians
+```
+
+#### 2. PyPilot IMU Source
+
+Tell PyPilot to use Signal K (BNO085) instead of looking for a local RTIMU chip:
+
+```bash
+cd /home/brian/pypilot
+# One-time run to write the persistent config value
+python3 -c "
+import sys, time
+sys.path.insert(0, '.')
+from pypilot.client import pypilotClient
+c = pypilotClient('localhost')
+c.set('imu.source', 'signalk')
+time.sleep(1)
+print('Done')
+"
+```
+
+Verify with:
+```bash
+curl -s http://localhost:23322/  # then check imu.source in output, or use pypilot web UI
+```
+
+#### 3. PyPilot Serial Port
+
+Ensure PyPilot only scans the socat virtual port (prevents slow startup scanning all USB devices):
+
+```bash
+mkdir -p ~/.pypilot
+echo '/dev/pypilot-servo' > ~/.pypilot/serial_ports
+```
+
+#### 4. Install / Reinstall Service Files
+
+```bash
+cd pypilot-serial-bridge/pi-setup
+
+# Install or update the bridge service
+sudo cp pypilot-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable pypilot-bridge.service
+sudo systemctl restart pypilot-bridge.service
+```
+
+---
+
+### Status Web Monitor
+
+**`pypilot-status.service`** runs a persistent live dashboard at `http://pypilotstatus.local`
+(port 80). It checks all 6 layers every 10 seconds and shows per-layer status cards with
+timing notes and direct links. The mDNS hostname is registered via `avahi-publish-address`
+automatically on service start.
+
+```bash
+# Check service status
+systemctl status pypilot-status.service
+
+# Follow logs
+journalctl -u pypilot-status.service -f
+
+# Restart
+systemctl restart pypilot-status.service
+```
+
+JSON API for scripting: `http://pypilotstatus.local/api/status`
+
+### Diagnostic Script (CLI)
+
+A manual CLI tool is also available at `pypilot-serial-bridge/pi-setup/check-pypilot.sh`
+for terminal use when the web monitor is not accessible.
+
+```bash
+# Make executable once
+chmod +x pypilot-serial-bridge/pi-setup/check-pypilot.sh
+
+# Run diagnostic
+./pypilot-serial-bridge/pi-setup/check-pypilot.sh
+
+# Run diagnostic + attempt automatic fixes
+./pypilot-serial-bridge/pi-setup/check-pypilot.sh --fix
+
+# Restart all services then check
+./pypilot-serial-bridge/pi-setup/check-pypilot.sh --restart-all
+```
+
+Example output when healthy:
+```
+━━━  LAYER 1 — Signal K Server
+  ✓  signalk.service is running
+  ✓  Signal K API responding on port 3000
+  ✓  navigation.headingMagnetic = 247.3°  (2s ago)
+
+━━━  LAYER 4 — socat Virtual Serial Port (/dev/pypilot-servo)
+  ✓  pypilot-bridge.service is running
+  ✓  /dev/pypilot-servo exists → /dev/pts/22
+  ✓  /dev/pypilot-servo is writable by current user
+
+━━━  LAYER 5 — PyPilot Autopilot
+  ✓  pypilot.service is running
+  ✓  PyPilot JSON server responding on TCP 23322
+  ✓  PyPilot IMU source = signalk
+```
+
+---
+
+### Known Failure Modes & Fixes
+
+| Symptom | Root Cause | Fix |
+|---------|-----------|-----|
+| `/dev/pypilot-servo` missing | `pypilot-bridge.service` failed & hit systemd restart limit | `systemctl reset-failed pypilot-bridge.service && systemctl start pypilot-bridge.service` |
+| Service shows 1000+ restarts then stops | Old service had `retry=10` — socat quits after 10 failed TCP attempts | Reinstall service file from repo (now uses `retry=forever`) |
+| Heading stale in SignalK (>60s old) | ESP32-S3 lost WiFi or rebooted | Check `compass.local` reachable; check green LED pulse |
+| Heading missing from Signal K entirely | Port mismatch — compass broadcasts to port X, SK listens on port Y | Run `./check-pypilot.sh` — it detects and shows exact fix URL |
+| Heading missing from Signal K entirely | Port 10110 taken by NMEA GPS provider, SK can't parse Signal K JSON on same port | Add new SK delta UDP input on different port AND change compass: `http://compass.local/setport?port=NNNN` |
+| PyPilot has no IMU data | `imu.source` not set to `signalk` | Run the one-liner above to set `imu.source=signalk` |
+| autopilot engaged but rudder not moving | `/dev/pypilot-servo` exists but ESP32-C3 is offline → socat reads EOF | `nc -z pypilot-bridge.local 20220` to check TCP; restart bridge service |
+| Motor controller not found by pypilot | `~/.pypilot/serial_ports` missing or wrong path | `echo '/dev/pypilot-servo' > ~/.pypilot/serial_ports` |
+| Signal K not receiving UDP | UDP input not configured, or port mismatch | Run `./check-pypilot.sh` for exact diagnosis |
+
+---
+
+### Web UIs Quick Reference
+
+| URL | What it shows |
+|-----|--------------|
+| `http://pypilotstatus.local` | **Live system status dashboard** — all 6 layers, auto-refreshing |
+| `http://compass.local` | ESP32-S3 BNO085 live heading dashboard |
+| `http://pypilot-bridge.local` | ESP32-C3 motor controller diagnostics |
+| `http://localhost:3000/admin/#/databrowser` | Signal K live data browser |
+| `http://localhost:8080` | PyPilot autopilot web control |
+
+---
+
+## Configuration Reference
+
+These are the actual files that must be set up correctly on the Raspberry Pi for the full system to work. They live outside this repo in the Pi's home directory.
+
+---
+
+### `~/.signalk/settings.json` — Signal K Server
+
+The critical section is `pipedProviders`. Two providers must be active:
+
+| ID | Type | Port | Purpose |
+|----|------|------|---------|
+| `SingalK_UDP_101022` | SignalK/UDP | **101022** | Receives compass heading delta from ESP32-S3 |
+| `GPS-dietPi` | NMEA0183/UDP | 10110 | Receives NMEA GPS sentences from the system GPS |
+
+> **Note:** Port 10110 is already used by the NMEA GPS — do **not** put the Signal K compass input on 10110. Use a separate port (101022 is the one currently configured). The `SingalK_UDP_101022` ID has a typo in the name; do not change the ID as it breaks the reference in settings.
+
+Relevant `pipedProviders` entries:
+
+```json
+{
+  "pipeElements": [{
+    "type": "providers/simple",
+    "options": {
+      "logging": false,
+      "type": "SignalK",
+      "subOptions": {
+        "type": "udp",
+        "port": "101022",
+        "selfHandling": "noSelf",
+        "overrideTimestamp": true
+      }
+    }
+  }],
+  "id": "SingalK_UDP_101022",
+  "enabled": true
+},
+{
+  "pipeElements": [{
+    "type": "providers/simple",
+    "options": {
+      "logging": true,
+      "type": "NMEA0183",
+      "subOptions": {
+        "validateChecksum": true,
+        "type": "udp",
+        "host": "127.0.0.1",
+        "port": "10110"
+      }
+    }
+  }],
+  "id": "GPS-dietPi",
+  "enabled": true
+}
+```
+
+To add the Signal K UDP input from scratch via the Admin UI:
+- Go to `http://localhost:3000/admin/#/server/connections`
+- Add connection → type: **Signal K (UDP)**, port: `101022`, self-handling: `noSelf`, override timestamp: on
+
+---
+
+### `~/.signalk/baseDeltas.json` — Vessel Identity
+
+Contains the vessel name and dimensions used by Signal K. Edit via:
+`http://localhost:3000/admin/#/vessel`
+
+Current values:
+```json
+{ "name": "Erinistine", "mmsi": "none-yet",
+  "design": { "length": { "overall": 11 }, "beam": 3.3, "draft": { "maximum": 2 }, "airHeight": 12 },
+  "sensors": { "gps": { "fromBow": 6, "fromCenter": 1.5 } } }
+```
+
+---
+
+### `~/.signalk/package.json` — Installed Plugins
+
+These Signal K plugins must be installed (`npm install` is run automatically by the server):
+
+| Package | Purpose |
+|---------|---------|
+| `pypilot-autopilot-provider` | Connects Signal K ↔ PyPilot (heading, AP commands) |
+| `@signalk/freeboard-sk` | Chart plotter webapp |
+| `@signalk/course-provider` | Course/routing support |
+| `@mxtommy/kip` | Instrument panel dashboard |
+| `@signalk/open-meteo-provider` | Weather data |
+| `signalk-ais-target-prioritizer` | AIS filtering |
+
+---
+
+### `~/.signalk/plugin-config-data/pypilot-autopilot-provider.json`
+
+```json
+{
+  "configuration": {
+    "pypilot": { "host": "localhost", "port": 8000 }
+  },
+  "enabled": true,
+  "enableLogging": false
+}
+```
+
+This must point to PyPilot's web/JSON server (port 8000, same host). Configured via `http://localhost:3000/admin/#/plugin-config` → PyPilot Autopilot Provider.
+
+---
+
+### `~/.pypilot/pypilot.conf` — PyPilot Main Configuration
+
+Key values that differ from defaults and must be preserved:
+
+```ini
+# IMU source — use Signal K instead of local hardware
+imu.source="signalk"
+
+# Signal K server location
+signalk.host="localhost"
+signalk.port=3000
+
+# Signal K WebSocket minPeriod — SK will push heading no faster than this (seconds)
+# 0.025 = 40 Hz, aligned with ESP32-S3 commsTask rate
+signalk.period=0.0250
+
+# Signal K auth token UID (auto-generated, must match signalk-token file)
+signalk.uid="pypilot-41552038451"
+
+# PID loop rate — how often the autopilot iteration runs (Hz)
+# 40 Hz = 25 ms loop, aligned with signalk.period and ESP32-S3 output rate
+imu.rate=40
+
+# Autopilot mode and pilot
+ap.mode="compass"
+ap.pilot="basic"
+
+# Servo parameters (tuned for this motor)
+servo.max_current=2.1500
+servo.max_controller_temp=60.0000
+servo.max_motor_temp=60.0000
+servo.position.p=0.1500
+servo.position.i=0.0000
+servo.position.d=0.0200
+
+# Pilot gains (tuned profile "default")
+[profile="default"]
+# servo.period = motor stiction windup window (NOT PID rate — see imu.rate above)
+# 0.1 = minimum allowed, tightest stiction response
+servo.period=0.1000
+ap.pilot.basic.P=0.0221
+ap.pilot.basic.I=0.0000
+ap.pilot.basic.D=0.0900
+ap.pilot.basic.DD=0.0750
+ap.pilot.basic.PR=0.0050
+ap.pilot.basic.FF=0.6000
+```
+
+To set `imu.source` via CLI (one-time, writes to this file):
+```bash
+cd ~/pypilot && python3 -c "
+from pypilot.client import pypilotClient
+c = pypilotClient('localhost')
+import time; time.sleep(1)
+c.set('imu.source', 'signalk')
+time.sleep(1); c.disconnect()
+"
+```
+
+---
+
+### `~/.pypilot/serial_ports` — Motor Controller Serial Device
+
+```
+/dev/pypilot-servo
+```
+
+This file tells PyPilot which serial device to probe for the motor controller. The `pypilot-bridge.service` creates `/dev/pypilot-servo` as a PTY linked via socat to the ESP32-C3 over TCP.
+
+To recreate if missing:
+```bash
+echo '/dev/pypilot-servo' > ~/.pypilot/serial_ports
+```
+
+---
+
+### `~/.pypilot/servodevice` — Last Known Servo Device
+
+```
+["/dev/pypilot-servo", 38400]
+```
+
+Auto-written by PyPilot after it successfully talks to the motor. Contains the device path and baud rate. If PyPilot fails to find the servo, delete this file to force a fresh probe:
+```bash
+rm ~/.pypilot/servodevice
+```
+
+---
+
+### `~/.pypilot/pypilot_client.conf` — PyPilot Client Connection
+
+```json
+{"host": "localhost", "port": 20220}
+```
+
+> **Note:** This port (20220) is the ESP32-C3 TCP server port, **not** PyPilot's own server. This file is used by CLI client tools. PyPilot's own server listens on 23322.
+
+---
+
+### `~/.pypilot/web.conf` — PyPilot Web UI
+
+```ini
+server="127.0.0.1"
+port=8000
+```
+
+PyPilot's web dashboard is at `http://localhost:8080` (mapped by service) or directly at port 8000 on localhost.
+
+---
+
+### `~/.pypilot/signalk-token` — Signal K Authentication Token
+
+PyPilot uses a JWT token to authenticate with Signal K. This is auto-generated on first connection but must survive reboot. The current token is stored in `~/.pypilot/signalk-token`.
+
+If PyPilot loses access to Signal K (e.g. after a Signal K security reset), delete this file and restart PyPilot — it will request a new token that you approve in the Signal K admin UI under **Security → Access Requests**.
 
 ---
 

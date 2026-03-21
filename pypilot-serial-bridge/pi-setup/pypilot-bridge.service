@@ -1,8 +1,9 @@
 [Unit]
-Description=PyPilot TCP Serial Bridge (socat → ESP32 WiFi bridge)
-Documentation=https://github.com/pypilot
+Description=PyPilot TCP-to-Serial Bridge (socat → ESP32-C3 WiFi)
+Documentation=https://github.com/Flyguy86/ESP32-S3-BNO085-IMU-Gateway
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -12,7 +13,6 @@ ExecStart=/usr/bin/socat \
 ExecStartPost=/bin/bash -c 'for i in $(seq 1 20); do [ -e /dev/pypilot-servo ] && chmod 666 /dev/pypilot-servo && break; sleep 0.5; done'
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target

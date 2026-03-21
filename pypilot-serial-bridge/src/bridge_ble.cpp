@@ -8,6 +8,7 @@
 #include "led_status.h"
 
 #include <NimBLEDevice.h>
+#include <esp_mac.h>
 
 static NimBLEServer*         pServer       = nullptr;
 static NimBLECharacteristic* pTxChar       = nullptr;   // notify (ESP→host)

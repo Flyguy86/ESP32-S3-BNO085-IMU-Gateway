@@ -1,6 +1,6 @@
 # 🧭 ESP32-S3 BNO085 Marine IMU Gateway
 
-> **Version:** v1.4.1 — 2026-03-21
+> **Version:** v1.5.0 — 2026-03-21
 
 A high-stability 9-DOF orientation system designed for **marine autopilot** compass heading. Bridges high-fidelity BNO085 sensor fusion data over **BLE**, **WiFi** (UDP + Web Dashboard), and **Signal K** (delta JSON). Built for the ESP32-S3-N16R8 with a dual-core architecture that separates critical sensor sampling from wireless communication.
 

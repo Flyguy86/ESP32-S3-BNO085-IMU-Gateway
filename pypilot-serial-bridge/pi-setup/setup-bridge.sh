@@ -146,6 +146,18 @@ if [ -f "${STATUS_SERVICE}" ]; then
     else
         echo "  ⚠ pypilot-status.service failed to start (check: journalctl -u pypilot-status.service)"
     fi
+
+    # Allow the status server to restart the bridge without a password prompt.
+    # pypilot-status.py calls: sudo systemctl restart pypilot-bridge.service
+    SUDOERS_FILE="/etc/sudoers.d/pypilot-status"
+    SUDOERS_RULE="${USER} ALL=(ALL) NOPASSWD: /bin/systemctl restart pypilot-bridge.service"
+    if ! sudo grep -qF "$SUDOERS_RULE" "$SUDOERS_FILE" 2>/dev/null; then
+        echo "$SUDOERS_RULE" | sudo tee "$SUDOERS_FILE" > /dev/null
+        sudo chmod 440 "$SUDOERS_FILE"
+        echo "  ✓ sudoers entry added: pypilot-status can restart pypilot-bridge.service"
+    else
+        echo "  ✓ sudoers entry already present"
+    fi
 else
     echo "  ⚠ pypilot-status.service not found in ${SCRIPT_DIR} — skipping"
 fi

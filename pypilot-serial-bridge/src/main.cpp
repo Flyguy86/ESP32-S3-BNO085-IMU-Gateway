@@ -349,6 +349,41 @@ void startStatusServer() {
         ESP.restart();
     });
 
+    // --- Motor telemetry JSON API -------------------------------------------
+    // GET /api/telem — returns latest decoded motor telemetry + UART counters.
+    // Used by pypilot-status.py to monitor command latency & serial saturation.
+    statusServer.on("/api/telem", HTTP_GET, [](AsyncWebServerRequest* req) {
+        const auto& t = protoSniffer.telemetry();
+        uint32_t ageMs = (t.lastUpdateMs > 0) ? (millis() - t.lastUpdateMs) : 0;
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+            "{"
+              "\"current_A\":%.2f,"
+              "\"voltage_V\":%.2f,"
+              "\"ctrl_temp_C\":%.1f,"
+              "\"motor_temp_C\":%.1f,"
+              "\"rudder_raw\":%u,"
+              "\"flags\":%u,"
+              "\"pkt_good\":%lu,"
+              "\"pkt_err\":%lu,"
+              "\"pkt_age_ms\":%lu,"
+              "\"rx_bytes\":%lu,"
+              "\"tx_bytes\":%lu,"
+              "\"uptime_s\":%lu"
+            "}",
+            t.current_A, t.voltage_V, t.controllerTemp_C, t.motorTemp_C,
+            (unsigned)t.rudderRaw, (unsigned)t.flags,
+            (unsigned long)t.packetCount, (unsigned long)t.errorCount,
+            (unsigned long)ageMs,
+            (unsigned long)serialBridge.rawByteCount,
+            (unsigned long)serialBridge.txByteCount,
+            (unsigned long)(millis() / 1000));
+        AsyncWebServerResponse* resp = req->beginResponse(200, "application/json", buf);
+        resp->addHeader("Cache-Control", "no-cache");
+        resp->addHeader("Access-Control-Allow-Origin", "*");
+        req->send(resp);
+    });
+
     // Attach diagnostic console (WebSocket + /console page)
     webConsoleAttach(statusServer);
 
